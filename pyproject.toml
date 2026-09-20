@@ -1,0 +1,27 @@
+[project]
+name = "agentfm"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.141.1",
+    "langchain>=1.4.0",
+    "langchain-openai>=1.6.0",
+    "langgraph>=1.2.11",
+    "pydantic-settings>=2.15.0",
+    "pymilvus>=3.0.1",
+    "pymysql>=1.2.0",
+    "python-dotenv>=1.2.3",
+    "sentence-transformers>=6.0.1",
+    "sqlalchemy>=2.0.52",
+    "streamlit>=1.63.0",
+    "uvicorn[standard]>=0.52.4",
+]
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
