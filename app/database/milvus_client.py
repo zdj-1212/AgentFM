@@ -140,7 +140,8 @@ def search(
     hits=[]
     # MilvusClient.search 返回: [[{id, distance, entity:{...}}, ...]]
     for hit in results[0]:
-        score=1.0-float(hit["distance"])
+        # score=1.0-float(hit["distance"])
+        score=float(hit["distance"])
 
         if score < score_threshold:
             continue

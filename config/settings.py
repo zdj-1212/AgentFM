@@ -66,6 +66,17 @@ class Settings(BaseSettings):
     # ---------------- 对话记忆 ----------------
     HISTORY_WINDOW: int = 6  # 携带最近几轮历史
 
+    # ---------------- 用户认证 ----------------
+    # 令牌签名密钥：生产环境务必通过 .env 覆盖为随机长字符串
+    AUTH_SECRET_KEY: str = "agentfm-dev-secret-change-me"
+    AUTH_TOKEN_TTL_HOURS: int = 72  # 登录令牌有效期（小时）
+    PASSWORD_MIN_LENGTH: int = 6
+
+    # ---------------- 会话标题 ----------------
+    TITLE_AUTO_SUMMARY: bool = True  # 用 LLM 概括首轮提问作为标题；关闭则直接截断问句
+    TITLE_MAX_CHARS: int = 20  # 标题最大字数
+    TITLE_TIMEOUT_SECONDS: float = 8.0  # 标题概括的最长等待时间，超时用截断问句兜底
+
     # ---------------- ReAct Agent ----------------
     # 工具循环最大步数，防止模型无限调用工具
     REACT_MAX_ITERATIONS: int = 6

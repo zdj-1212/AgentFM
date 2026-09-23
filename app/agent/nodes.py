@@ -29,7 +29,7 @@ from app.agent.prompts import (
     SYSTEM_ORDER_AGENT,
     SYSTEM_RAG_PROMPT
 )
-from app.agent.state import AgentState,Intent
+from app.agent.state import AgentState,Intent,UserContext
 from app.agent.tools import query_order_status,query_orders_by_user,search_knowledge
 from app.core.llm import get_llm
 from app.core.logger import get_logger
@@ -157,11 +157,23 @@ def _order_agent():
 
     注：LangGraph 1.x 中工具循环上限不再作为 create_react_agent 参数，
     而是通过 invoke 时的 config={"recursion_limit": N} 控制（见 order_node）。
+
+    注：Agent 实例本身与用户无关，可以全局复用；"当前用户是谁"通过
+    invoke 时的 context=UserContext(...) 注入（见 _build_agent_context），
+    因此不需要按用户缓存 Agent。
     """
     return create_agent(
         model=get_llm(),
         tools=[query_order_status, query_orders_by_user],
         system_prompt=SYSTEM_ORDER_AGENT,
+        context_schema=UserContext,
+    )
+
+def _build_agent_context(state: AgentState) -> UserContext:
+    """从图状态构造工具运行时上下文（当前登录用户身份）。"""
+    return UserContext(
+        user_id=state.get("user_id") or 0,
+        user_name=state.get("user_name", ""),
     )
 
 def order_node(state:AgentState)->Dict:
@@ -173,6 +185,7 @@ def order_node(state:AgentState)->Dict:
         result = agent.invoke(
             {"messages":msgs},
             config={"recursion_limit": settings.REACT_MAX_ITERATIONS * 4},
+            context=_build_agent_context(state),
         )
         response=result["messages"][-1].content
         return {"response":response}
@@ -186,11 +199,12 @@ def order_node(state:AgentState)->Dict:
 
 @lru_cache(maxsize=1)
 def _general_agent():
-    """综合 Agent：同时拥有知识检索 + 订单查询工具。"""
+    """综合 Agent：同时拥有知识检索 + 订单查询工具（全局复用的单例）。"""
     return create_agent(
         model=get_llm(),
         tools=[search_knowledge, query_order_status, query_orders_by_user],
         system_prompt=SYSTEM_GENERAL_AGENT,
+        context_schema=UserContext,
     )
 
 def general_node(state: AgentState) -> Dict:
@@ -202,6 +216,7 @@ def general_node(state: AgentState) -> Dict:
         result = agent.invoke(
             {"messages": msgs},
             config={"recursion_limit": settings.REACT_MAX_ITERATIONS * 4},
+            context=_build_agent_context(state),
         )
         response = result["messages"][-1].content
         return {"response": response}
@@ -240,13 +255,17 @@ def finalize_node(state: AgentState) -> Dict:
             "intent": state.get("intent", Intent.GENERAL).value,
             "sources": state.get("sources", []),
         }
+        # 参数名必须是 meta（对应 ORM 的 meta 列）：形参叫 metadata 会被 SQLAlchemy
+        # 当成未映射属性静默吞掉，intent/sources 永远写不进去。
         mysql_client.add_message(
             session_id=state["session_id"],
             role="assistant",
             content=state["response"],
-            metadata=metadata,
+            meta=metadata,
         )
-        mysql_client.touch_conversation(state["session_id"])
+        mysql_client.touch_conversation(
+            state["session_id"], user_id=state.get("user_id")
+        )
     except Exception as e:
         logger.warning("助手消息落库失败（不影响返回）: %s", e)
     return {}

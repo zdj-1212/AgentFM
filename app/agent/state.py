@@ -8,8 +8,29 @@ LangGraph 的核心是"状态机"：State 是各节点共享的数据结构，�
 - Intent：意图枚举（路由的依据）
 - AgentState：整个 Agent 图的共享状态（TypedDict）
 """
+from dataclasses import dataclass
 from enum import Enum
 from typing import Dict,List,Optional,TypedDict
+
+
+@dataclass
+class UserContext:
+    """
+    工具调用时注入的"当前登录用户"运行时上下文。
+
+    为什么单独定义而不是塞进 AgentState：
+    ReAct Agent 内部的工具（如查订单）需要知道"我是谁"，但这个身份**绝不能**
+    作为工具参数暴露给大模型——否则模型可以被用户一句"查张三的订单"诱导去查别人的数据。
+    LangChain 1.x 的 runtime context（ToolRuntime）正好用于传递这类"框架注入、
+    模型不可见"的信息：工具签名里标注 ToolRuntime[UserContext, Any]，
+    调用方通过 agent.invoke(..., context=UserContext(...)) 传入，
+    实测该参数不会出现在工具的 args schema 里（模型看不到、也伪造不了）。
+
+    本类不 import 任何 app.* 模块，避免与 agent 包形成循环依赖。
+    """
+
+    user_id: int
+    user_name: str = ""
 
 class Intent(str,Enum):
     """用户意图分类（路由的依据）。
@@ -30,6 +51,7 @@ class AgentState(TypedDict):
 
     字段说明：
     - session_id / user_name : 会话标识（用于持久化与个性化）
+    - user_id                : 当前登录用户 id，用于数据隔离（订单查询按它过滤）
     - user_input             : 用户本轮问题
     - intent                 : 路由得到的意图
     - history                : 最近几轮对话历史 [{role, content}, ...]
@@ -40,6 +62,7 @@ class AgentState(TypedDict):
     """
 
     session_id: str
+    user_id: int
     user_name: str
     user_input: str
     intent: Intent

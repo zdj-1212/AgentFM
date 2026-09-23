@@ -41,4 +41,5 @@ def build_context(query: str, top_k: int = None) -> tuple[str, List[Dict]]:
 
     context = "\n\n".join(parts)
     logger.info("检索到 %s 条相关内容", len(hits))
+    # logger.info(f"传入模型的文档：{context}")
     return context, hits
