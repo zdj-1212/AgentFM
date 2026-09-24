@@ -46,6 +46,25 @@ class Intent(str,Enum):
     CHITCHAT = "chitchat"
     GENERAL = "general"
 
+class ErrorCode(str,Enum):
+    """节点失败时对外暴露的"降级原因"。
+
+    四个节点失败时都会返回同一句兜底话术（FALLBACK_RESPONSE），如果不额外标记原因，
+    调用方（前端 / API 使用方 / 运维）就无法区分到底是知识库挂了、大模型超时还是
+    订单库连不上——现象完全一样，只能去翻日志。
+
+    因此节点在返回兜底话术的同时带上这里的一个枚举值：
+    - 粒度"按依赖"而不是"按异常"：使用者只需要知道该找谁，不需要知道堆栈；
+    - 值本身是稳定常量而非异常字符串：既便于前端做差异化提示，
+      也不会把内部实现（表名、连接地址、堆栈片段）泄露给外部调用方。
+    完整的异常与堆栈照旧由节点里的 logger.exception 记录。
+    """
+
+    KNOWLEDGE_UNAVAILABLE = "knowledge_unavailable"  # RAG 节点失败（通常是 Milvus / Embedding）
+    ORDER_UNAVAILABLE = "order_unavailable"          # 订单 Agent 失败（通常是 LLM / MySQL）
+    GENERAL_UNAVAILABLE = "general_unavailable"      # 综合兜底 Agent 失败
+    CHITCHAT_UNAVAILABLE = "chitchat_unavailable"    # 闲聊节点失败（通常是 LLM）
+
 class AgentState(TypedDict):
     """Agent 图全局状态（所有节点共享的"黑板"）。
 
@@ -58,7 +77,9 @@ class AgentState(TypedDict):
     - context / hits         : RAG 检索得到的上下文与命中块
     - response               : 最终回复文本
     - sources                : 引用来源列表（供前端溯源展示）
-    - error                  : 异常信息（可选）
+    - error                  : 内部异常信息（只进日志，不外发）
+    - error_code             : 对外暴露的降级原因（ErrorCode 的取值，正常时为 None）
+    - message_id             : 落库后的助手消息 id（供前端立刻对这条回复点赞/点踩）
     """
 
     session_id: str
@@ -72,3 +93,5 @@ class AgentState(TypedDict):
     response: str
     sources: List[Dict]
     error: Optional[str]
+    error_code: Optional[str]
+    message_id: Optional[int]

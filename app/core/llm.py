@@ -19,6 +19,10 @@ def get_llm()->BaseChatModel:
             temperature=settings.LLM_TEMPERATURE,
             max_tokens=settings.LLM_MAX_TOKENS,
             extra_body=extra_body,
+            # 必须显式设置：这两个参数默认是 None，会退化成 openai SDK 的默认值
+            # （600 秒超时 + 2 次重试），一次卡住的大模型调用足以把请求挂住十几分钟。
+            request_timeout=settings.LLM_TIMEOUT_SECONDS,
+            max_retries=settings.LLM_MAX_RETRIES,
         )
 
     raise ValueError(f"不支持的 LLM_PROVIDER: {settings.LLM_PROVIDER}")

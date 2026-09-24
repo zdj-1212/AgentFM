@@ -92,6 +92,10 @@ def insert_documents(doc:List[Dict])->int:
     ]
     res=get_milvus().insert(collection_name=settings.MILVUS_COLLECTION,data=data)
     logger.info(f"已经写入{len(data)}条向量到 {settings.MILVUS_COLLECTION}")
+    # 必须 flush + load：刚写入的数据还在未封存的增量段里，Milvus 不会立刻把它算进
+    # query/search 的结果。少了这一步，紧接着的 count() 会返回 0、search() 一条都搜不到，
+    # 表现为"首次入库明明说成功了，知识库却像是空的"。
+    flush_and_load()
     return res.get("insert_count",len(data))
 
 def search(
@@ -140,7 +144,10 @@ def search(
     hits=[]
     # MilvusClient.search 返回: [[{id, distance, entity:{...}}, ...]]
     for hit in results[0]:
-        # score=1.0-float(hit["distance"])
+        # 注意：集合的 metric_type 是 COSINE，Milvus 对 COSINE 返回的 distance
+        # 本身就是余弦相似度（越大越相关），**不是**距离，所以这里直接取用。
+        # 曾经写成 score=1.0-float(hit["distance"])——那会把相关性整个反过来：
+        # 最相关的切片被阈值滤掉，留下最不相关的，且分数含义也不再是"相似度"。
         score=float(hit["distance"])
 
         if score < score_threshold:

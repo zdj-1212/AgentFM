@@ -31,7 +31,10 @@ class ApiEmbedding(BaseEmbedding):
             model=settings.EMBEDDING_API_MODEL,
             base_url=settings.EMBEDDING_API_BASE,
             api_key=settings.EMBEDDING_API_KEY,
-            check_embedding_ctx_length =settings.CHECK_EMBEDDING_CTX_LENGTH
+            check_embedding_ctx_length =settings.CHECK_EMBEDDING_CTX_LENGTH,
+            # 同 LLM：不显式设置就会吃 SDK 的 600 秒默认超时
+            request_timeout=settings.EMBEDDING_TIMEOUT_SECONDS,
+            max_retries=settings.EMBEDDING_MAX_RETRIES,
         )
 
     def embed_documents(self,texts:List[str]) ->List[List[float]]:

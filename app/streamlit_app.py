@@ -21,25 +21,38 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 import streamlit as st
 
+from app.core.logger import get_logger
+from app.services import admin_service
 from app.services.auth_service import AuthError, auth_service
 from app.services.chat_service import chat_service
 
+logger = get_logger(__name__)
+
 # ---------- 页面基础配置 ----------
-st.set_page_config(page_title="AgentFM 企业智能客服", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="AgentFM 企业智能客服", layout="wide")
 
 # 意图中文名
 INTENT_NAMES = {
-    "knowledge": "📚 知识问答",
-    "order": "📦 订单查询",
-    "chitchat": "💬 闲聊",
-    "general": "🧭 综合问答",
+    "knowledge": "知识问答",
+    "order": "订单查询",
+    "chitchat": "闲聊",
+    "general": "综合问答",
+}
+
+# 降级提示：节点失败时回复都是同一句兜底话术，光看那句话分不清是哪个依赖出了问题。
+# 这里按 error_code 给出各自的说明，让用户知道该重试还是该报修。
+ERROR_HINTS = {
+    "knowledge_unavailable": "⚠️ 知识库暂时不可用，本条为降级回复。请稍后重试。",
+    "order_unavailable": "⚠️ 订单查询服务暂时不可用，本条为降级回复。请稍后重试。",
+    "general_unavailable": "⚠️ 智能客服暂时不可用，本条为降级回复。请稍后重试。",
+    "chitchat_unavailable": "⚠️ 智能客服暂时不可用，本条为降级回复。请稍后重试。",
 }
 
 
 # ---------- 登录 / 注册页 ----------
 def render_auth_page() -> None:
     """未登录时展示的登录/注册界面。"""
-    st.title("🤖 AgentFM 企业智能客服")
+    st.title("AgentFM 企业智能客服")
     st.caption("请先登录。每个账号只能看到自己的会话与订单数据。")
 
     login_tab, register_tab = st.tabs(["登录", "注册"])
@@ -124,11 +137,12 @@ if flash := st.session_state.pop("flash", None):
 
 # ---------- 侧边栏：用户信息 + 会话管理 ----------
 with st.sidebar:
-    st.title("🤖 AgentFM")
+    st.title("AgentFM")
     st.caption("企业级多智能体客服（LangGraph + RAG + Milvus + MySQL）")
-    st.caption(f"👤 当前用户：{DISPLAY_NAME}")
+    is_admin = auth_service.is_admin(current_user)
+    st.caption(f" 当前用户：{DISPLAY_NAME}" + ("　 管理员" if is_admin else ""))
 
-    if st.button("🆕 新建会话", width="stretch"):
+    if st.button("新建会话", width="stretch"):
         st.session_state.session_id = chat_service.create_session(USER_ID, DISPLAY_NAME)
         st.session_state.messages = []
         st.rerun()
@@ -154,13 +168,27 @@ with st.sidebar:
                     {
                         "role": h["role"],
                         "content": h["content"],
+                        "message_id": h["message_id"],
+                        "feedback": h["feedback"],
                     }
                     for h in history
                 ]
             st.rerun()
 
     st.divider()
-    if st.button("退出登录", width="stretch"):
+    if st.button(
+        "退出登录",
+        width="stretch",
+        help="退出后该账号已签发的所有登录令牌都会失效，其它设备需重新登录",
+    ):
+        # 先吊销服务端令牌，再清本地状态。
+        # 网页端本身不发令牌（直接走服务层），所以这一步不是给自己用的——
+        # 它是为了让"退出登录"对 REST API 那边签发的令牌同样生效，
+        # 否则网页上点了退出，之前发出的令牌还能继续用到过期为止。
+        try:
+            auth_service.revoke_tokens(USER_ID)
+        except Exception as e:
+            logger.warning("吊销令牌失败（不阻断退出）: %s", e)
         # 必须整体清空：残留的 session_id / messages 会让下一个登录者看到上一个用户的数据
         st.session_state.clear()
         st.rerun()
@@ -169,19 +197,85 @@ with st.sidebar:
 
 
 # ---------- 主区：对话气泡 ----------
-st.title("💬 企业智能客服")
 
-# 渲染历史消息
-for msg in st.session_state.messages:
+FEEDBACK_LABELS = {1: "👍 已赞", -1: "👎 已踩", None: "未评价"}
+
+
+def _save_feedback(msg: dict, feedback, note: str = "") -> None:
+    """写评价并同步本地状态，然后重跑让按钮状态立刻更新。"""
+    mid = msg.get("message_id")
+    if mid is None:
+        st.warning("这条回复尚未落库，暂时无法评价")
+        return
+    try:
+        chat_service.set_feedback(
+            st.session_state.session_id, mid, USER_ID, feedback, note
+        )
+    except (PermissionError, ValueError) as e:
+        st.error(str(e))
+        return
+    msg["feedback"] = feedback
+    if note:
+        msg["feedback_note"] = note
+    st.rerun()
+
+
+def _render_feedback(msg: dict) -> None:
+    """在助手回复下方渲染 👍/👎；点踩后可补一句原因（这一步是选填）。"""
+    if msg.get("message_id") is None:
+        return
+
+    current = msg.get("feedback")
+    col_up, col_down, col_state = st.columns([1, 1, 5])
+    if col_up.button(
+        "👍", key=f"fbup_{msg['message_id']}",
+        type="primary" if current == 1 else "secondary",
+        help="这条回答有帮助",
+    ):
+        _save_feedback(msg, 1 if current != 1 else None)
+    if col_down.button(
+        "👎", key=f"fbdown_{msg['message_id']}",
+        type="primary" if current == -1 else "secondary",
+        help="这条回答没帮助，可再补充原因",
+    ):
+        _save_feedback(msg, -1 if current != -1 else None)
+    col_state.caption(f"反馈：{FEEDBACK_LABELS.get(current, '未评价')}")
+
+    # 点了踩才展开原因框：form 里的输入不会每敲一个字就重跑整个页面
+    if current == -1:
+        with st.form(key=f"fbnote_{msg['message_id']}", border=False):
+            note = st.text_input(
+                "哪里不对？（选填）",
+                value=msg.get("feedback_note") or "",
+                key=f"fbtxt_{msg['message_id']}",
+            )
+            if st.form_submit_button("保存原因"):
+                _save_feedback(msg, -1, note.strip())
+
+
+def _render_message(msg: dict) -> None:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        if msg.get("error_code"):
+            st.warning(ERROR_HINTS.get(msg["error_code"], "⚠️ 本条为降级回复。"))
         if msg.get("sources"):
             with st.expander("📎 引用来源"):
                 for src in msg["sources"]:
                     st.markdown(f"- **{src['title']}**（{src['source']}，相似度 {src['score']}）")
+        if msg["role"] == "assistant":
+            _render_feedback(msg)
 
-# 输入框
-if prompt := st.chat_input("请输入你的问题，例如：七天无理由退货条件是什么？/ 我的订单到哪里了？"):
+
+def render_chat() -> None:
+    """我的对话：历史气泡 + 输入框。"""
+    for msg in st.session_state.messages:
+        _render_message(msg)
+
+    if not (prompt := st.chat_input(
+        "请输入你的问题，例如：七天无理由退货条件是什么？/ 我的订单到哪里了？"
+    )):
+        return
+
     # 1) 展示用户消息
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -200,6 +294,8 @@ if prompt := st.chat_input("请输入你的问题，例如：七天无理由退�
                 result = {"reply": f"出错了：{e}", "intent": "error", "sources": []}
 
         st.markdown(result["reply"])
+        if result.get("error_code"):
+            st.warning(ERROR_HINTS.get(result["error_code"], "⚠️ 本条为降级回复。"))
         st.caption(f"🛰️ 路由：{INTENT_NAMES.get(result['intent'], result['intent'])}")
         if result.get("sources"):
             with st.expander("📎 引用来源"):
@@ -212,8 +308,115 @@ if prompt := st.chat_input("请输入你的问题，例如：七天无理由退�
             "content": result["reply"],
             "intent": result["intent"],
             "sources": result.get("sources", []),
+            "error_code": result.get("error_code"),
+            "message_id": result.get("message_id"),
+            "feedback": None,
         }
     )
 
     # 3) 首轮提问会生成会话标题，刷新侧边栏让新标题立刻可见
     st.rerun()
+
+
+def render_admin_console() -> None:
+    """
+    运营工作台：所有用户的会话/消息/评价一览，可下钻到某个用户的会话与消息。
+
+    注意这里的每一次数据获取都要经过 admin_service 的 require_admin 闸门——
+    UI 上"只有管理员看得到这个页签"不算保护，服务层必须独立再判一次。
+    """
+    st.subheader("运营总览")
+
+    try:
+        stats = admin_service.overview(current_user)
+        summary = admin_service.feedback_summary(current_user)
+    except PermissionError as e:
+        st.error(str(e))
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("用户数", len(stats))
+    c2.metric("会话数", sum(r["sessions"] for r in stats))
+    c3.metric("消息数", sum(r["messages"] for r in stats))
+    c4.metric(
+        "好评率",
+        f"{summary['satisfaction'] * 100:.0f}%" if summary["satisfaction"] is not None else "暂无评价",
+        help=f"👍 {summary['up']} / 👎 {summary['down']}",
+    )
+
+    if not stats:
+        st.info("还没有任何用户数据")
+        return
+
+    st.caption("点击任意一行下钻查看该用户的会话与消息")
+    event = st.dataframe(
+        [
+            {
+                "用户": r["display_name"],
+                "角色": "管理员" if r["role"] == "admin" else "普通用户",
+                "会话数": r["sessions"],
+                "消息数": r["messages"],
+                "👍": r["up"],
+                "👎": r["down"],
+            }
+            for r in stats
+        ],
+        width="stretch",
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="admin_overview_table",
+    )
+
+    picked = event.selection.rows if event and event.selection else []
+    if not picked:
+        return
+
+    target = stats[picked[0]]
+    if not target["sessions"]:
+        st.info(f"{target['display_name']} 还没有任何会话")
+        return
+
+    st.divider()
+    st.subheader(f" {target['display_name']} 的会话")
+    try:
+        sessions = admin_service.user_sessions(current_user, target["user_id"])
+    except PermissionError as e:
+        st.error(str(e))
+        return
+
+    labels = {s["session_id"]: f"{s['title']}（{s['updated_at']}）" for s in sessions}
+    chosen = st.selectbox(
+        "选择一个会话查看消息",
+        options=list(labels),
+        format_func=lambda sid: labels[sid],
+        key="admin_session_pick",
+    )
+    try:
+        messages = admin_service.session_messages(current_user, chosen)
+    except (PermissionError, ValueError) as e:
+        st.error(str(e))
+        return
+
+    for m in messages:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+            if m["role"] == "assistant":
+                mark = FEEDBACK_LABELS.get(m["feedback"], "未评价")
+                note = f"｜原因：{m['feedback_note']}" if m["feedback_note"] else ""
+                st.caption(f"{m['created_at']}　反馈：{mark}{note}")
+
+
+# ---------- 主区 ----------
+st.title(" 企业智能客服")
+
+# 管理员多一个"运营工作台"页签；普通用户界面完全不变。
+# 角色来自服务端会话信息，不来自任何前端输入。
+if is_admin:
+    tab_chat, tab_admin = st.tabs([" 对话", " 运营工作台"])
+    with tab_chat:
+        render_chat()
+    with tab_admin:
+        render_admin_console()
+else:
+    render_chat()

@@ -29,7 +29,7 @@ from app.agent.prompts import (
     SYSTEM_ORDER_AGENT,
     SYSTEM_RAG_PROMPT
 )
-from app.agent.state import AgentState,Intent,UserContext
+from app.agent.state import AgentState,ErrorCode,Intent,UserContext
 from app.agent.tools import query_order_status,query_orders_by_user,search_knowledge
 from app.core.llm import get_llm
 from app.core.logger import get_logger
@@ -145,7 +145,13 @@ def rag_node(state: AgentState) -> Dict:
         return {"response": answer, "hits": hits, "sources": sources}
     except Exception as e:
         logger.exception("RAG 节点异常")
-        return {"response": FALLBACK_RESPONSE, "hits": [], "sources": [], "error": str(e)}
+        return {
+            "response": FALLBACK_RESPONSE,
+            "hits": [],
+            "sources": [],
+            "error": str(e),
+            "error_code": ErrorCode.KNOWLEDGE_UNAVAILABLE.value,
+        }
 
 # ============================================================
 # 节点：订单/物流查询（ReAct Agent + MySQL 工具）
@@ -191,7 +197,11 @@ def order_node(state:AgentState)->Dict:
         return {"response":response}
     except Exception as e:
         logger.exception("订单 Agent 异常")
-        return {"response": FALLBACK_RESPONSE, "error": str(e)}
+        return {
+            "response": FALLBACK_RESPONSE,
+            "error": str(e),
+            "error_code": ErrorCode.ORDER_UNAVAILABLE.value,
+        }
 
 # ============================================================
 # 节点：综合兜底（ReAct Agent + 检索/业务工具）
@@ -222,7 +232,11 @@ def general_node(state: AgentState) -> Dict:
         return {"response": response}
     except Exception as e:
         logger.exception("综合 Agent 异常")
-        return {"response": FALLBACK_RESPONSE, "error": str(e)}
+        return {
+            "response": FALLBACK_RESPONSE,
+            "error": str(e),
+            "error_code": ErrorCode.GENERAL_UNAVAILABLE.value,
+        }
 
 # ============================================================
 # 节点：闲聊
@@ -235,14 +249,20 @@ def chitchat_node(state: AgentState) -> Dict:
         reply =llm.invoke(
             [
                 SystemMessage(content=SYSTEM_CHITCHAT),
-                *[HumanMessage(content="content") if h["role"]=="user" else AIMessage(content=h["content"]) for h in state.get("history",[])],
+                # 复用统一的转换函数：这里曾经手写成 HumanMessage(content="content")，
+                # 把每一轮用户历史都变成了字面量 "content"（模型看到的是一串 "content"）。
+                *_build_history_messages(state.get("history", [])),
                 HumanMessage(content=state["user_input"]),
             ]
         ).content
         return {"response": reply}
     except Exception as e:
         logger.exception("闲聊节点异常")
-        return {"response": FALLBACK_RESPONSE, "error": str(e)}
+        return {
+            "response": FALLBACK_RESPONSE,
+            "error": str(e),
+            "error_code": ErrorCode.CHITCHAT_UNAVAILABLE.value,
+        }
 
 # ============================================================
 # 节点：落库 + 组装最终输出
@@ -257,7 +277,7 @@ def finalize_node(state: AgentState) -> Dict:
         }
         # 参数名必须是 meta（对应 ORM 的 meta 列）：形参叫 metadata 会被 SQLAlchemy
         # 当成未映射属性静默吞掉，intent/sources 永远写不进去。
-        mysql_client.add_message(
+        saved = mysql_client.add_message(
             session_id=state["session_id"],
             role="assistant",
             content=state["response"],
@@ -266,6 +286,9 @@ def finalize_node(state: AgentState) -> Dict:
         mysql_client.touch_conversation(
             state["session_id"], user_id=state.get("user_id")
         )
+        # 把落库后的消息 id 带回状态：前端要立刻对"刚刚这条回复"展示 👍/👎，
+        # 有 id 才写得进去评价，否则得再查一次库才能拿到它。
+        return {"message_id": saved.id}
     except Exception as e:
         logger.warning("助手消息落库失败（不影响返回）: %s", e)
     return {}

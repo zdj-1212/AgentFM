@@ -18,7 +18,7 @@
 """
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict,List
+from typing import Dict,List,Optional
 
 from app.agent.graph import get_graph
 from app.agent.prompts import TITLE_SUMMARY_PROMPT
@@ -74,14 +74,55 @@ class ChatService:
         """返回某会话的全部历史消息（供前端回显）。
 
         会话不属于该用户时抛 PermissionError，避免"知道 session_id 就能读别人对话"。
+        带上 message_id 与已有评价，前端才能渲染出"这条我赞过/踩过"的状态。
         """
         if mysql_client.get_conversation(session_id, user_id) is None:
             raise PermissionError("会话不存在或无权访问")
 
         return [
-            {"role": m.role, "content": m.content, "created_at": m.created_at.strftime("%Y-%m-%d %H:%M:%S")}
+            {
+                "message_id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "feedback": m.feedback,
+                "created_at": m.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            }
             for m in mysql_client.get_recent_messages(session_id, limit=100)
         ]
+
+    def set_feedback(
+        self,
+        session_id: str,
+        message_id: int,
+        user_id: int,
+        feedback: Optional[int],
+        note: str = "",
+    ) -> bool:
+        """
+        给某条助手回复写评价（1=👍 / -1=👎 / None=取消）。
+
+        两道校验，缺一不可：
+        1. 会话必须属于调用者（否则等于能给别人机器人的回答打标）；
+        2. 消息必须属于该会话且是 assistant —— 这条由 DAO 的 UPDATE 条件保证。
+
+        返回是否真的写入了（消息不存在 / 不属于自己 -> False）。
+        """
+        if feedback is not None and feedback not in (1, -1):
+            raise ValueError("feedback 只能是 1（赞）、-1（踩）或 None（取消）")
+
+        if mysql_client.get_conversation(session_id, user_id) is None:
+            raise PermissionError("会话不存在或无权访问")
+
+        note = (note or "").strip()[:255]  # 与列宽一致，避免超长被数据库截断/报错
+        ok = mysql_client.set_message_feedback(
+            message_id, user_id, feedback, note or None
+        )
+        if ok:
+            logger.info(
+                "[feedback] session=%s message=%s user_id=%s -> %s",
+                session_id, message_id, user_id, feedback,
+            )
+        return ok
 
     # ---------------- 对话主流程 ----------------
     def ask(self,session_id:str,message:str,user_id:int,user_name:str="")->Dict:
@@ -91,7 +132,7 @@ class ChatService:
         2. 落库用户消息；
         3. 若是该会话的**首轮提问**，并行生成一条会话标题；
         4. 取出最近历史作为多轮记忆，调用 LangGraph 工作流；
-        5. 返回 {session_id, reply, intent, sources}。
+        5. 返回 {session_id, reply, intent, sources, error_code}（error_code 非空即为降级回复）。
         """
         message=message.strip()
         if not message:
@@ -140,6 +181,8 @@ class ChatService:
             "response": "",
             "sources": [],
             "error": None,
+            "error_code": None,
+            "message_id": None,
         }
 
         logger.info("[ask] session=%s user_id=%s question=%s", session_id, user_id, message[:30])
@@ -150,7 +193,13 @@ class ChatService:
             if title_future is not None:
                 _save_title(session_id, user_id, title_future, message)
 
-        # 7) 组装返回值
+        # 7) 组装返回值。
+        #    error_code 非空表示这是"降级回复"（节点失败后的兜底话术），
+        #    调用方据此能区分"知识库挂了"和"正常但没查到"，不用去猜同一句话术背后的原因。
+        error_code = result.get("error_code")
+        if error_code:
+            logger.warning("[ask] 本轮为降级回复: session=%s code=%s", session_id, error_code)
+
         return {
             "session_id": session_id,
             "reply": result.get("response", ""),
@@ -158,6 +207,9 @@ class ChatService:
             if isinstance(result.get("intent"), Intent)
             else str(result.get("intent", "general")),
             "sources": result.get("sources", []),
+            "error_code": error_code,
+            # 刚落库的助手消息 id，前端据此对这条回复展示评价按钮
+            "message_id": result.get("message_id"),
         }
 
 

@@ -94,6 +94,9 @@ def main() -> None:
             result = chat_service.ask(session_id, user_input, user_id, user_name)
             print(f"[意图] {INTENT_NAMES.get(result['intent'], result['intent'])}")
             print(f"客服 > {result['reply']}")
+            if result.get("error_code"):
+                # 兜底话术四个节点都一样，把降级原因打出来才知道是哪个依赖出了问题
+                print(f"[降级] 本轮为兜底回复，原因：{result['error_code']}")
             if result.get("sources"):
                 print("[来源] " + "、".join(s["title"] for s in result["sources"]))
             print("-" * 50)

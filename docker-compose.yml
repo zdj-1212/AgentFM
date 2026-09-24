@@ -1,0 +1,141 @@
+# AgentFM 依赖服务编排（MySQL + Milvus + Redis）
+# =============================================
+# 只编排"基础设施"，不包含本应用：
+# 应用直接在宿主机上用 uv 跑（见 README）。原因是 sentence-transformers 会拖进
+# torch，打成镜像有好几个 GB，而 .env 里的 LLM/Embedding Key 也是宿主机上更好管。
+#
+# 用法（项目根目录）：
+#     cp .env.example .env      # 先填好 LLM_API_KEY / EMBEDDING_API_KEY
+#     docker compose up -d
+#     docker compose ps         # 等 milvus 变成 healthy，首次启动约 1 分钟
+#
+# 版本对齐说明：这里的 Milvus 与 MySQL 版本刻意与作者本机环境保持一致
+# （Milvus 3.0.0 / MySQL 9.7），避免"容器里能跑、本机跑不通"这类版本差异问题。
+#
+# 端口：默认与 .env 中的 127.0.0.1:3306 / 127.0.0.1:19530 对齐，
+# 因此 compose up 之后不需要改任何配置。端口被占用时用环境变量覆盖，例如：
+#     MYSQL_PORT=13306 MILVUS_PORT=29530 docker compose up -d
+#
+# 本文件里的 ${VAR:-default} 取自项目根目录的 .env（docker compose 会自动读取），
+# 所以数据库密码直接复用应用自己的 MYSQL_PASSWORD，不额外引入一套变量名。
+
+services:
+  redis:
+    image: redis:6.2
+    container_name: agentfm-redis
+    restart: unless-stopped
+    # 应用侧的 REDIS_PASSWORD 直接复用成 Redis 的 requirepass，两处不可能写歪。
+    # 留空则不加密码（仅建议本地临时使用）。
+    command: >
+      sh -c 'if [ -n "$$REDIS_PASSWORD" ];
+             then exec redis-server --requirepass "$$REDIS_PASSWORD";
+             else exec redis-server; fi'
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      # 有密码时要用 -a 才能通过健康检查，所以这里也走一遍同样的判断
+      test: ["CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then redis-cli -a \"$$REDIS_PASSWORD\" ping; else redis-cli ping; fi"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  mysql:
+    image: mysql:9.7
+    container_name: agentfm-mysql
+    restart: unless-stopped
+    environment:
+      # 复用应用侧的 MYSQL_PASSWORD：幂等，且两处密码不可能写歪
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-123456}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-agentfm}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      # 用命名卷而不是绑定挂载：Windows 下绑定挂载 MySQL 数据目录容易踩权限/换行符的坑
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.25
+    container_name: agentfm-etcd
+    restart: unless-stopped
+    environment:
+      # Milvus 把元数据放在 etcd，这几个压缩/配额参数取自 Milvus 官方 standalone 编排
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    volumes:
+      - etcd_data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:RELEASE.2024-05-28T17-19-04Z
+    container_name: agentfm-minio
+    restart: unless-stopped
+    environment:
+      # 仅容器内网使用，不对外暴露，沿用 Milvus 官方编排的默认凭据
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    ports:
+      # 只暴露控制台，方便排查对象存储；9000 留给集群内部
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/minio_data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  milvus:
+    image: milvusdb/milvus:v3.0.0
+    container_name: agentfm-milvus
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_REGION: us-east-1
+    ports:
+      - "${MILVUS_PORT:-19530}:19530"
+      - "${MILVUS_METRICS_PORT:-9091}:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
+  redis_data:
+  etcd_data:
+  minio_data:
+  milvus_data:

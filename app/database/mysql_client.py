@@ -8,7 +8,7 @@ MySQL 数据访问层（SQLAlchemy 2.0 ORM）
 4. 提供轻量幂等迁移（_ensure_column），保证已存在的库也能加上新列。
 
 表设计说明：
-- users          用户表：登录账号，passwords 以 PBKDF2 哈希存储（见 services/auth_service.py）
+- users          用户表：登录账号，口令以 argon2id 哈希存储（见 services/auth_service.py）
 - conversations  会话表：一次前端对话窗口 = 一个 session_id，user_id 标识归属用户
 - messages       消息表：会话内每轮问答的 user/assistant 消息（支持多轮记忆）
 - order_info     订单表：业务数据，user_id 标识归属用户，供 Agent 通过工具查询
@@ -20,10 +20,10 @@ MySQL 数据访问层（SQLAlchemy 2.0 ORM）
 """
 from contextlib import contextmanager
 from datetime import datetime
-from typing import List,Optional
+from typing import Dict,List,Optional
 from decimal import Decimal
 
-from sqlalchemy import JSON,DateTime,Index,Integer,String,TEXT,create_engine,text,Numeric
+from sqlalchemy import JSON,DateTime,Index,Integer,String,TEXT,create_engine,func,text,Numeric
 from sqlalchemy.orm import DeclarativeBase,Mapped,mapped_column,sessionmaker
 
 from config.settings import settings
@@ -38,13 +38,25 @@ class Base(DeclarativeBase):
 class User(Base):
     """用户表：登录账号。
 
-    口令只存 PBKDF2 哈希（格式 pbkdf2_sha256$迭代次数$盐$摘要），永不存明文。
+    口令只存 argon2id 哈希（盐与参数编码在哈希串里），永不存明文。
+    历史上的 PBKDF2 格式已全部迁移完毕，旧的兼容校验逻辑也已删除（见 auth_service）。
+
+    token_version 是**令牌吊销**的依据：令牌 payload 里带着签发时的版本号，
+    校验时与库里的值比对，不一致即视为已吊销。退出登录就把这个值 +1，
+    该用户**所有已签发的令牌**立即失效。
+    相比"维护一张已吊销令牌的名单"，这样做没有清理负担、也不会因为进程重启或
+    多 worker 而出现各进程状态不一致。
     """
     __tablename__ = "users"
     id:Mapped[int] = mapped_column(primary_key=True,autoincrement=True)
     username:Mapped[str] = mapped_column(String(64),unique=True,index=True)
     password_hash:Mapped[str] = mapped_column(String(255))
     display_name:Mapped[str] = mapped_column(String(64),default="")
+    token_version: Mapped[int] = mapped_column(Integer,default=0,server_default="0")
+    # 角色：'user' 普通用户 / 'admin' 管理员（可跨用户查看会话与反馈）。
+    # 只能由后台/种子数据设置，**注册接口永远不接受这个字段**（见 auth_service.register——
+    # 允许客户端指定角色等于让所有人一键自封管理员）。
+    role: Mapped[str] = mapped_column(String(16),default="user",server_default="user")
     created_at: Mapped[datetime] = mapped_column(DateTime,default=datetime.now)
 
 class Conversation(Base):
@@ -64,7 +76,12 @@ class Conversation(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime,default=datetime.now,onupdate=datetime.now)
 
 class Message(Base):
-    """消息表：会话内每条消息（user / assistant）。"""
+    """消息表：会话内每条消息（user / assistant）。
+
+    feedback 是用户对**助手回复**的评价：1=👍，-1=👎，NULL=未评价。
+    用户消息不会有评价，所以这两个字段对 role='user' 的行恒为 NULL。
+    反馈攒起来就是最有价值的东西——它是后面做评测集、判断"哪类问题答不好"的原始信号。
+    """
     __tablename__ = "messages"
     __table_args__ = (Index("idx_session_created", "session_id", "created_at"),)
 
@@ -75,6 +92,8 @@ class Message(Base):
     # metadata 存 JSON：可记录意图、引用来源等结构化信息（如 sources）
     # 注意：Python 属性名不能用 metadata（SQLAlchemy 保留字），故用 meta
     meta:Mapped[Optional[dict]] = mapped_column("meta",JSON,nullable=True)
+    feedback: Mapped[Optional[int]] = mapped_column(Integer,nullable=True)
+    feedback_note: Mapped[Optional[str]] = mapped_column(String(255),nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime,default=datetime.now)
 
 class OrderInfo(Base):
@@ -233,6 +252,28 @@ def init_db():
         "user_id",
         "ALTER TABLE order_info ADD COLUMN user_id INT NULL, ADD INDEX idx_order_user (user_id)",
     )
+    # 令牌吊销：已存在的库里补上版本列，存量用户默认 0（DEFAULT 让已有行直接可读，
+    # 不需要额外的回填 UPDATE）
+    _ensure_column(
+        "users",
+        "token_version",
+        "ALTER TABLE users ADD COLUMN token_version INT NOT NULL DEFAULT 0",
+    )
+    # 角色分级：存量用户一律是普通用户（DEFAULT 'user' 直接让已有行可读）
+    _ensure_column(
+        "users",
+        "role",
+        "ALTER TABLE users ADD COLUMN role VARCHAR(16) NOT NULL DEFAULT 'user'",
+    )
+    # 答案反馈：可空，未评价即 NULL
+    _ensure_column(
+        "messages", "feedback", "ALTER TABLE messages ADD COLUMN feedback INT NULL"
+    )
+    _ensure_column(
+        "messages",
+        "feedback_note",
+        "ALTER TABLE messages ADD COLUMN feedback_note VARCHAR(255) NULL",
+    )
 
     # 隔离上线：旧会话没有归属用户，直接清空（产品决策）
     purge_legacy_conversations()
@@ -246,7 +287,11 @@ def init_db():
 # ---------------- 用户 DAO ----------------
 
 def create_user(username: str, password_hash: str, display_name: str = "") -> User:
-    """新建用户；用户名重复会抛 IntegrityError（services 层已提前查重并给出友好提示）。"""
+    """新建用户；用户名重复会抛 IntegrityError（services 层已提前查重并给出友好提示）。
+
+    **刻意不接受 role 参数**：这个函数是注册接口的唯一落库出口，一旦开放角色入参，
+    注册请求就能自封管理员。角色只能由种子数据或后台直接改库设置。
+    """
     with session_scope() as s:
         user = User(
             username=username,
@@ -265,6 +310,23 @@ def get_user_by_id(user_id: int) -> Optional[User]:
     """按主键查用户；不存在返回 None。"""
     with session_scope() as s:
         return s.query(User).filter(User.id == user_id).first()
+
+def bump_token_version(user_id: int) -> Optional[int]:
+    """
+    令牌版本 +1（= 吊销该用户全部已签发令牌），返回新版本号；用户不存在返回 None。
+
+    这里用的是 SQL 的原子自增，而不是"先查出来 +1 再写回"：后者在并发下会丢更新
+    （两个请求同时读到 5、都写 6，等于只加了一次，于是就有一批本该失效的令牌继续能用）。
+    """
+    with session_scope() as s:
+        affected = (
+            s.query(User)
+            .filter(User.id == user_id)
+            .update({User.token_version: User.token_version + 1}, synchronize_session=False)
+        )
+        if not affected:
+            return None
+        return s.query(User.token_version).filter(User.id == user_id).scalar()
 
 def delete_user(user_id: int) -> int:
     """
@@ -345,6 +407,23 @@ def list_conversations(user_id: int, limit: int = 20) -> List[Conversation]:
             .all()
         )
 
+def list_conversations_by_user_ids(user_ids: List[int], limit: int = 50) -> List[Conversation]:
+    """返回指定的多个用户的会话（管理员总览下钻用）。
+
+    只接受显式的 user_id 列表，不提供"不传就查全表"的默认行为：
+    这种"省略参数 = 全量"的口子一旦存在，早晚会被某次误调用变成越权查询。
+    """
+    if not user_ids:
+        return []
+    with session_scope() as s:
+        return (
+            s.query(Conversation)
+            .filter(Conversation.user_id.in_(user_ids))
+            .order_by(Conversation.updated_at.desc())
+            .limit(limit)
+            .all()
+        )
+
 def touch_conversation(session_id: str, title: str = None, user_id: Optional[int] = None) -> None:
     """更新会话的更新时间（每次问答后调用）；传 title 时一并更新标题。
 
@@ -402,6 +481,110 @@ def get_recent_messages(session_id: str, limit: int = 10) -> List[Message]:
         )
         return list(reversed(rows))
 
+def set_message_feedback(
+    message_id: int,
+    user_id: int,
+    feedback: Optional[int],
+    note: Optional[str] = None,
+) -> bool:
+    """
+    给某条助手消息写评价（1=👍 / -1=👎 / None=取消评价）。
+
+    归属校验直接写进 UPDATE 的 WHERE 里（messages 关联 conversations 再比对 user_id）：
+    用一条语句同时完成"校验 + 写入"，比"先查出来判断、再更新"更不容易被绕过——
+    后者中间多出一个可以忘记判断的分支。返回是否真的改到了行。
+    """
+    with session_scope() as s:
+        session_ids = [
+            row[0]
+            for row in s.query(Conversation.session_id).filter(Conversation.user_id == user_id).all()
+        ]
+        if not session_ids:
+            return False
+        affected = (
+            s.query(Message)
+            .filter(
+                Message.id == message_id,
+                Message.session_id.in_(session_ids),
+                # 只允许评价助手回复：给用户自己的提问点赞没有意义
+                Message.role == "assistant",
+            )
+            .update(
+                {Message.feedback: feedback, Message.feedback_note: note},
+                synchronize_session=False,
+            )
+        )
+        return bool(affected)
+
+def update_password_hash(user_id: int, password_hash: str) -> bool:
+    """
+    更新口令哈希（用于把旧格式的哈希就地升级为新算法，见 auth_service.authenticate）。
+    返回是否真的改到了行。
+    """
+    with session_scope() as s:
+        affected = (
+            s.query(User)
+            .filter(User.id == user_id)
+            .update({User.password_hash: password_hash}, synchronize_session=False)
+        )
+        return bool(affected)
+
+def get_message(message_id: int) -> Optional[Message]:
+    """按主键取消息（仅供管理员下钻等只读场景使用，调用方须自行确认权限）。"""
+    with session_scope() as s:
+        return s.query(Message).filter(Message.id == message_id).first()
+
+# ---------------- 管理员统计 ----------------
+
+def user_feedback_stats() -> List[Dict]:
+    """
+    按用户汇总：会话数、消息数、👍 数、👎 数。供管理员总览页使用。
+
+    用一次 GROUP BY 查询取全量，而不是"先列用户再逐个用户查三遍"（N+1）。
+    👍/👎 只统计助手消息上的评价。
+    """
+    with session_scope() as s:
+        conversations = dict(
+            s.query(Conversation.user_id, func.count(Conversation.id))
+            .group_by(Conversation.user_id)
+            .all()
+        )
+        messages = dict(
+            s.query(Conversation.user_id, func.count(Message.id))
+            .join(Message, Message.session_id == Conversation.session_id)
+            .group_by(Conversation.user_id)
+            .all()
+        )
+        thumbs = dict(
+            (
+                (user_id, feedback),
+                count,
+            )
+            for user_id, feedback, count in s.query(
+                Conversation.user_id, Message.feedback, func.count(Message.id)
+            )
+            .join(Message, Message.session_id == Conversation.session_id)
+            .filter(Message.feedback.isnot(None))
+            .group_by(Conversation.user_id, Message.feedback)
+            .all()
+        )
+
+        result = []
+        for user in s.query(User).order_by(User.id.asc()).all():
+            result.append(
+                {
+                    "user_id": user.id,
+                    "username": user.username,
+                    "display_name": user.display_name or user.username,
+                    "role": user.role or "user",
+                    "sessions": int(conversations.get(user.id, 0)),
+                    "messages": int(messages.get(user.id, 0)),
+                    "up": int(thumbs.get((user.id, 1), 0)),
+                    "down": int(thumbs.get((user.id, -1), 0)),
+                }
+            )
+        return result
+
 # ---------------- 订单/物流 DAO（供 Agent 工具调用） ----------------
 
 def query_order_by_id(order_id: str) -> Optional[OrderInfo]:
@@ -446,9 +629,14 @@ DEMO_USERS = [
 ]
 DEMO_PASSWORD = "123456"
 
+# 演示管理员：能看到所有人的会话与反馈（运营视角）。
+# 张三既是订单演示账号也是管理员，这样用同一个账号就能同时演示"我的会话"和"运营总览"；
+# 李四/王五保持普通用户，用来验证隔离对普通用户依然严格。
+DEMO_ADMIN_USERNAME = "张三"
+
 
 def seed_demo_users() -> None:
-    """写入演示账号（幂等：已存在的用户名跳过）。"""
+    """写入演示账号（幂等：已存在的用户名跳过），并把演示管理员提升为 admin。"""
     from app.services.auth_service import hash_password  # 延迟导入，避免与 services 层循环依赖
 
     created = 0
@@ -462,13 +650,25 @@ def seed_demo_users() -> None:
                     username=username,
                     password_hash=hash_password(DEMO_PASSWORD),
                     display_name=display_name,
+                    # 角色在种子里显式指定；注册接口永远走默认的 'user'
+                    role="admin" if username == DEMO_ADMIN_USERNAME else "user",
                 )
             )
             created += 1
+
+        # 已存在的演示管理员也要补上角色：否则在"角色功能上线前"就已经建好的库里，
+        # 张三会一直停留在 user，运营总览页根本进不去。
+        promoted = (
+            s.query(User)
+            .filter(User.username == DEMO_ADMIN_USERNAME, User.role != "admin")
+            .update({User.role: "admin"}, synchronize_session=False)
+        )
     if created:
         logger.info("已创建 %s 个演示账号（密码均为 %s）", created, DEMO_PASSWORD)
     else:
         logger.info("演示账号已存在，跳过初始化")
+    if promoted:
+        logger.info("已将演示管理员 %s 的角色设为 admin", DEMO_ADMIN_USERNAME)
 
 
 def seed_demo_data() -> None:

@@ -73,6 +73,11 @@ def ingest(reset: bool =False)->int:
         inserted,
         milvus_client.count(),
     )
+
+    # 知识库变了，缓存里基于旧内容的检索结果必须作废，否则会继续拿旧切片回答
+    from app.knowledge.retriever import invalidate_cache
+
+    invalidate_cache()
     return inserted
 
 

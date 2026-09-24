@@ -12,25 +12,40 @@ AgentFM REST API 服务（FastAPI）
     POST /auth/register              注册，返回登录令牌
     POST /auth/login                 登录，返回登录令牌
     GET  /auth/me                    当前登录用户信息
+    POST /auth/logout                退出登录（吊销该账号全部令牌）
     POST /chat                       对话（自动创建会话或续接指定会话）
     GET  /sessions                   当前用户的会话列表
     GET  /sessions/{sid}/messages    某会话历史
+    POST /sessions/{sid}/messages/{mid}/feedback   给助手回复打分（👍/👎）
+    GET  /admin/overview             运营总览：各用户会话/消息/评价数（仅管理员）
+    GET  /admin/feedback/summary     反馈汇总（仅管理员）
+    GET  /admin/users/{uid}/sessions 指定用户的会话（仅管理员）
+    GET  /admin/sessions/{sid}/messages  任意会话的消息（仅管理员）
 
 鉴权说明
 --------
 除 /health 与 /auth/* 外，所有接口都要求请求头携带 `Authorization: Bearer <token>`，
 用户身份**只从令牌解析**，绝不信任请求体里的用户名字段——
 否则任何调用方都能自称是别人，数据隔离就成了摆设。
+
+限流说明
+--------
+/auth/login 与 /auth/register 是唯一可匿名调用、且每次都要跑一次口令哈希（argon2id）的接口，
+因此两者都加了限流（见 app/core/rate_limit.py）。超限返回 429 并带 `Retry-After`。
+配了 Redis 则计数全局一致（多进程/重启都算数）；没有 Redis 时退回进程内计数，
+此时多 worker 各算各的——严格限流请再在网关层加一道。
 """
 from contextlib import asynccontextmanager
 from typing import Dict,List,Optional
 
-from fastapi import Depends,FastAPI,HTTPException,status
+from fastapi import Depends,FastAPI,HTTPException,Request,status
 from fastapi.security import HTTPAuthorizationCredentials,HTTPBearer
 from pydantic import BaseModel,Field
 
 from app.core.logger import get_logger
+from app.core.rate_limit import allow_auth_attempt,record_auth_failure
 from app.database import mysql_client
+from app.services import admin_service
 from app.services.auth_service import AuthError,auth_service
 from app.services.chat_service import chat_service
 
@@ -61,7 +76,11 @@ _bearer = HTTPBearer(auto_error=False, description="登录接口返回的 access
 def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
 ) -> Dict:
-    """从 Bearer 令牌解析当前用户；令牌缺失/伪造/过期一律 401。"""
+    """从 Bearer 令牌解析当前用户；令牌缺失/伪造/过期/已吊销一律 401。
+
+    校验统一收敛在 auth_service.authenticate_token：签名、有效期、以及
+    与库里 token_version 的比对（退出登录会把它 +1，从而让旧令牌立即失效）。
+    """
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -70,23 +89,13 @@ def get_current_user(
         )
 
     try:
-        payload = auth_service.parse_token(credentials.credentials)
+        return auth_service.authenticate_token(credentials.credentials)
     except AuthError as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(e),
             headers={"WWW-Authenticate": "Bearer"},
         )
-
-    # 令牌验签通过不代表账号还在（可能已被删除），再确认一次
-    user = auth_service.get_user(payload["user_id"])
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="账号不存在或已被禁用",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return user
 
 
 # ---------------- 请求/响应模型 ----------------
@@ -103,6 +112,7 @@ class UserInfo(BaseModel):
     user_id: int
     username: str
     display_name: str
+    role: str = "user"
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -124,6 +134,11 @@ class ChatResponse(BaseModel):
     reply: str
     intent: str
     sources: List[SourceItem] = []
+    error_code: Optional[str] = Field(
+        None,
+        description="降级原因。为空表示正常回复；非空表示本轮回复为兜底话术，"
+        "取值见 knowledge_unavailable / order_unavailable / general_unavailable / chitchat_unavailable",
+    )
 
 class SessionItem(BaseModel):
     session_id: str
@@ -166,9 +181,28 @@ def _token_response(user: Dict) -> TokenResponse:
         user=UserInfo(**user),
     )
 
+def _too_many_attempts(retry_after: float, reason: str) -> HTTPException:
+    """统一的 429 响应；Retry-After 让调用方知道该等多久。"""
+    detail = (
+        "认证尝试过于频繁，请稍后再试"
+        if reason == "ip"
+        else "该账号失败次数过多，请稍后再试"
+    )
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail=detail,
+        headers={"Retry-After": str(max(1, int(retry_after + 0.999)))},
+    )
+
 @app.post("/auth/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
-def register(req: RegisterRequest):
+def register(req: RegisterRequest, request: Request):
     """注册新用户，成功即返回登录令牌（免去再登录一次）。"""
+    # 只按来源限流：注册的风险是"被刷"（每次都要跑一次口令哈希），
+    # 不需要按账号维度计数（那反而会误伤第一次来注册的正常用户）。
+    allowed, retry_after, reason = allow_auth_attempt(request)
+    if not allowed:
+        raise _too_many_attempts(retry_after, reason)
+
     try:
         user = auth_service.register(req.username, req.password, req.display_name)
     except AuthError as e:
@@ -178,11 +212,19 @@ def register(req: RegisterRequest):
     return _token_response(user)
 
 @app.post("/auth/login", response_model=TokenResponse)
-def login(req: LoginRequest):
+def login(req: LoginRequest, request: Request):
     """用户名密码登录，返回 Bearer 令牌。"""
+    # 限流必须在 authenticate() 之前：它内部有一次昂贵的口令哈希，
+    # 放在后面等于"已经把 CPU 花完了再告诉对方不许试"。
+    allowed, retry_after, reason = allow_auth_attempt(request, req.username)
+    if not allowed:
+        raise _too_many_attempts(retry_after, reason)
+
     try:
         user = auth_service.authenticate(req.username, req.password)
     except AuthError as e:
+        # 失败才计入"按账号"维度：正常登录成功不该把自己算进失败次数
+        record_auth_failure(req.username)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(e),
@@ -194,6 +236,88 @@ def login(req: LoginRequest):
 def me(user: Dict = Depends(get_current_user)):
     """返回当前登录用户信息（前端可用它校验令牌是否仍然有效）。"""
     return UserInfo(**user)
+
+@app.post("/auth/logout")
+def logout(user: Dict = Depends(get_current_user)):
+    """退出登录：吊销该用户的全部令牌，之后所有旧令牌都会 401。
+
+    语义是"退出所有设备"而不是"只退出当前这一个"——单令牌精确吊销需要维护
+    已吊销令牌名单（带来清理与多进程一致性问题），本项目取更简单也更稳的方案。
+    """
+    auth_service.revoke_tokens(user["user_id"])
+    return {"detail": "已退出登录，该账号的全部令牌已失效"}
+
+
+# ---------------- 答案反馈 ----------------
+
+class FeedbackRequest(BaseModel):
+    feedback: Optional[int] = Field(
+        ..., description="1=👍，-1=👎，null=取消评价"
+    )
+    note: Optional[str] = Field(None, description="可选的一句原因", max_length=255)
+
+@app.post("/sessions/{session_id}/messages/{message_id}/feedback")
+def set_feedback(
+    session_id: str,
+    message_id: int,
+    req: FeedbackRequest,
+    user: Dict = Depends(get_current_user),
+):
+    """给某条助手回复打分（只能打自己会话里的）。"""
+    if req.feedback not in (1, -1, None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="feedback 只能是 1、-1 或 null"
+        )
+    try:
+        ok = chat_service.set_feedback(
+            session_id, message_id, user["user_id"], req.feedback, req.note or ""
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    if not ok:
+        # 用 404 而不是 403：不泄露"这条消息确实存在，只是不属于你"
+        raise HTTPException(status_code=404, detail="消息不存在或不属于该会话")
+    return {"detail": "评价已记录", "feedback": req.feedback}
+
+
+# ---------------- 管理员接口（运营视角） ----------------
+
+@app.get("/admin/overview")
+def admin_overview(user: Dict = Depends(get_current_user)):
+    """运营总览：每个用户的会话数、消息数、👍/👎（仅管理员）。"""
+    try:
+        return admin_service.overview(user)
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+@app.get("/admin/feedback/summary")
+def admin_feedback_summary(user: Dict = Depends(get_current_user)):
+    """反馈汇总：整体满意度（仅管理员）。"""
+    try:
+        return admin_service.feedback_summary(user)
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+@app.get("/admin/users/{user_id}/sessions")
+def admin_user_sessions(user_id: int, user: Dict = Depends(get_current_user)):
+    """查看指定用户的会话列表（仅管理员）。"""
+    try:
+        return admin_service.user_sessions(user, user_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+@app.get("/admin/sessions/{session_id}/messages")
+def admin_session_messages(session_id: str, user: Dict = Depends(get_current_user)):
+    """查看任意会话的消息（仅管理员）。"""
+    try:
+        return admin_service.session_messages(user, session_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 # ---------------- 业务接口 ----------------
 
@@ -208,15 +332,18 @@ def chat(req: ChatRequest, user: Dict = Depends(get_current_user)):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
+    except Exception:
+        # 不把 str(e) 回给调用方：未预期的异常里可能带表名、连接地址、堆栈片段等内部信息。
+        # 完整堆栈已进日志，对外只给一句稳定的提示。
         logger.exception("chat 接口异常")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="服务内部错误，请稍后重试")
 
     return ChatResponse(
         session_id=result["session_id"],
         reply=result["reply"],
         intent=result["intent"],
         sources=[SourceItem(**s) for s in result.get("sources", [])],
+        error_code=result.get("error_code"),
     )
 
 @app.get("/sessions", response_model=List[SessionItem])

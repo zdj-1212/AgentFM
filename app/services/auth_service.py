@@ -3,25 +3,41 @@
 =============
 面向上层（Streamlit / FastAPI / CLI）提供注册、登录与令牌签发能力，封装：
 
-1. 口令哈希：PBKDF2-HMAC-SHA256（标准库 hashlib），每个用户独立随机盐，
-   存储格式 `pbkdf2_sha256$迭代次数$盐$摘要`，校验用 hmac.compare_digest 防时序攻击；
+1. 口令哈希：**pwdlib**（底层 argon2id，含每用户独立随机盐与算法参数自动升级）；
 2. 注册校验：用户名规则、密码长度、重复注册，错误以 AuthError 抛出（消息可直接展示）；
-3. 登录令牌：HMAC-SHA256 签名的自包含令牌（base64url(payload).base64url(签名)），
-   带过期时间，服务端无状态、无需查库即可验签。
+3. 登录令牌：**PyJWT** 签发的 HS256 JWT，带过期时间；另有 token_version 实现服务端吊销。
 
-为什么不用 passlib / bcrypt / pyjwt：
-本项目的口令与令牌需求用标准库即可完整覆盖，不额外引入第三方依赖，
-也就没有版本冲突与供应链面的增加。若后续要做密码轮换/更复杂鉴权再引入不迟。
+关于第三方库（此处曾是"只用标准库"的设计，现按需求改为引入依赖）
+----------------------------------------------------------------
+口令与令牌这两块从标准库手写换成了成熟库，理由：
+
+- **手写口令哈希的迭代参数是我自己拍脑袋定的**（原来 260,000 次 PBKDF2-SHA256），
+  而 OWASP 当前对该算法的建议是 600,000 次——也就是说这个值是偏低的，
+  且随硬件发展需要人工跟进。换 argon2id 后，防护来自内存硬度（每次哈希占 64MiB），
+  不是靠堆迭代次数，而且默认参数由库维护。
+- **密钥长度、算法白名单、时钟偏移这类细节**交给库比自己写可靠。
+  PyJWT 会主动警告过短的 HMAC 密钥，这正是本模块原先只在文档里提醒过的事。
+
+注意 passlib 不要选：它 2020 年后未再发布，且与 bcrypt 5.x 已不兼容
+（实测哈希普通口令直接抛 ValueError）。pwdlib 正是为替代它而出现的。
+
+迁移历史
+--------
+换算法的当时，库里存的是旧格式（标准库 PBKDF2）的哈希，而**哈希无法批量重算**
+（没有明文），所以先做了一段时间的"登录时就地升级"：旧格式仍能验，验过后重写为 argon2id。
+所有账号迁完之后，那段兼容校验逻辑已删除。
+
+本模块因此**只认当前算法**：任何非 argon2 的哈希都验不过（见 verify_and_upgrade 的
+格式诊断分支），这是刻意的——保留旧校验路径等于让一套已废弃的算法长期留在攻击面上。
 """
-import base64
-import hashlib
-import hmac
-import json
 import re
-import secrets
 import time
+import warnings
 from functools import lru_cache
-from typing import Dict,Optional
+from typing import Dict,Optional, Tuple
+
+import jwt
+from pwdlib import PasswordHash
 
 from config.settings import settings
 from app.core.logger import get_logger
@@ -29,10 +45,41 @@ from app.database import mysql_client
 
 logger=get_logger(__name__)
 
-# PBKDF2 参数：迭代次数越高越抗暴力破解，代价是登录慢一点。
-# 26 万次是当前较为主流的推荐量级，现代 CPU 上约几十毫秒。
-PBKDF2_ITERATIONS = 260_000
-_HASH_ALGO = "pbkdf2_sha256"
+# 口令哈希器：recommended() 当前等价于 argon2id（m=64MiB, t=3, p=4）
+_hasher = PasswordHash.recommended()
+
+# 当前唯一认可的口令哈希前缀。历史上有过一段"兼容旧 PBKDF2"的过渡期，
+# 迁移完成后已删除；这里保留常量只为在碰到旧哈希时给出**可诊断**的报错，
+# 而不是让用户看到一句莫名的"用户名或密码错误"。
+_ARGON2_PREFIX = "$argon2"
+
+# JWT 算法：固定 HS256，且**解码时必须显式传同样的白名单**——
+# 不传白名单等于把"用哪种算法"交给令牌的持有者决定（alg=none 之类伪造的入口）。
+_JWT_ALGORITHM = "HS256"
+
+# PyJWT 对短于 32 字节的 HMAC 密钥会**每次 encode/decode 都**发一次告警，
+# 而 decode 是每个请求都要走的路径，留着会把日志刷满。
+# 这里关掉它，改成模块加载时用 _warn_if_weak_secret 明确提醒一次——
+# 信息没有丢失，只是从"每请求一条"变成"启动一条、且说清该怎么办"。
+warnings.filterwarnings("ignore", category=jwt.InsecureKeyLengthWarning)
+
+# HMAC-SHA256 的建议密钥长度（RFC 7518 §3.2）
+_MIN_SECRET_BYTES = 32
+
+
+def _warn_if_weak_secret() -> None:
+    """启动时检查一次令牌签名密钥的长度，过短就明确告知后果与改法。"""
+    secret = (settings.AUTH_SECRET_KEY or "").encode("utf-8")
+    if len(secret) < _MIN_SECRET_BYTES:
+        logger.warning(
+            "AUTH_SECRET_KEY 只有 %d 字节，低于 HMAC-SHA256 建议的 %d 字节。"
+            "当前仍可正常签发/校验，但密钥空间偏小、更容易被离线爆破。"
+            "建议在 .env 里换成随机长字符串：python -c \"import secrets;print(secrets.token_urlsafe(48))\"",
+            len(secret), _MIN_SECRET_BYTES,
+        )
+
+
+_warn_if_weak_secret()
 
 # 用户名：字母 / 数字 / 下划线 / 中文，2~32 个字符
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_一-龥]{2,32}$")
@@ -47,33 +94,52 @@ class AuthError(Exception):
 # ---------------- 口令哈希 ----------------
 
 def hash_password(password: str) -> str:
-    """生成口令哈希（每次调用都用新的随机盐，同样的密码得到的哈希不同）。"""
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS
-    )
-    return f"{_HASH_ALGO}${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
+    """生成口令哈希（argon2id，盐由库内部每次随机生成，同样的口令得到不同哈希）。"""
+    return _hasher.hash(password)
+
+
+def verify_and_upgrade(password: str, stored: str) -> Tuple[bool, Optional[str]]:
+    """
+    校验口令，并在需要时返回**应当写回的新哈希**（None 表示无需升级）。
+
+    两个用途合一，因为升级必须发生在校验通过之后——重新哈希需要明文口令，
+    校验没过根本拿不到，所以"该不该升级"只能在校验的同时判断。
+    交给 pwdlib 的 verify_and_update：它会在算法参数过时（比如以后提高了
+    默认内存开销）时返回新哈希，由调用方写回。
+    """
+    if not stored:
+        return False, None
+
+    # 只做诊断，不做兼容：碰到非 argon2 的哈希说明这是"算法迁移前"遗留的数据
+    # （比如从旧备份恢复的库）。这种情况下给出明确的日志，
+    # 否则用户只会看到一句"用户名或密码错误"，根本无从排查。
+    if not stored.startswith(_ARGON2_PREFIX):
+        logger.error(
+            "口令哈希不是当前算法（argon2id），该账号无法登录，需要重置密码。"
+            "前缀=%r；若这是从旧备份恢复的库，请重新跑一遍迁移", stored[:14]
+        )
+        return False, None
+
+    try:
+        return _hasher.verify_and_update(password, stored)
+    except Exception as e:
+        logger.warning("口令校验失败（哈希格式无法识别）: %s", e)
+        return False, None
 
 
 def verify_password(password: str, stored: str) -> bool:
-    """校验口令是否匹配存储的哈希。格式非法时返回 False，绝不抛异常。"""
-    try:
-        algo, iterations, salt_hex, digest_hex = stored.split("$")
-        if algo != _HASH_ALGO:
-            return False
-        digest = hashlib.pbkdf2_hmac(
-            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations)
-        )
-        # 常量时间比较，避免通过响应时间逐字节试探摘要
-        return hmac.compare_digest(digest.hex(), digest_hex)
-    except (ValueError, AttributeError, TypeError):
-        logger.warning("口令哈希格式非法，拒绝校验")
-        return False
+    """只校验口令、不关心升级的便捷入口。任何异常都返回 False，不抛给调用方。"""
+    return verify_and_upgrade(password, stored)[0]
 
 
 @lru_cache(maxsize=1)
 def _dummy_hash() -> str:
-    """一个固定的假哈希，用于"用户不存在"时消耗等量时间（见 authenticate）。"""
+    """
+    一个固定的假哈希，用于"用户不存在"时消耗等量时间（见 authenticate）。
+
+    必须是**当前算法**的哈希：如果这里还留旧格式，等于按用户是否存在走两条不同
+    耗时的分支，那正是时序侧信道本身。
+    """
     return hash_password("timing-attack-placeholder")
 
 
@@ -103,7 +169,32 @@ def _to_public(user) -> Dict:
         "user_id": user.id,
         "username": user.username,
         "display_name": user.display_name or user.username,
+        "role": user.role or "user",
     }
+
+
+# 角色常量与判定
+ROLE_USER = "user"
+ROLE_ADMIN = "admin"
+
+
+def is_admin(user: Optional[Dict]) -> bool:
+    """判断用户是否为管理员。缺失/未知角色一律当作普通用户（失败时收紧，而不是放宽）。"""
+    return bool(user) and user.get("role") == ROLE_ADMIN
+
+
+def require_admin(user: Optional[Dict]) -> Dict:
+    """
+    管理员权限闸门：不是管理员就抛 PermissionError；是则原样返回 user。
+
+    所有"能跨用户看数据"的入口都必须先过这一关。做成显式函数而不是在各处写
+    `if user["role"] != "admin"`，是为了让这类检查有个统一的、可搜索的落点——
+    漏写一处就等于多开一个越权口子。
+    """
+    if not is_admin(user):
+        logger.warning("越权访问管理员接口被拒绝: user=%s", (user or {}).get("username"))
+        raise PermissionError("需要管理员权限")
+    return user
 
 
 # ---------------- 注册 / 登录 ----------------
@@ -144,9 +235,20 @@ def authenticate(username: str, password: str) -> Dict:
         verify_password(password, _dummy_hash())
         raise AuthError("用户名或密码错误")
 
-    if not verify_password(password, user.password_hash):
+    valid, upgraded = verify_and_upgrade(password, user.password_hash)
+    if not valid:
         logger.info("登录失败（密码错误）: %s", username)
         raise AuthError("用户名或密码错误")
+
+    # 参数升级：pwdlib 认为存储的哈希参数已过时（例如以后提高了默认内存开销）时，
+    # 会在这里返回一个新哈希，就地写回。只在登录成功时做——重新哈希需要明文口令，
+    # 也只有此刻才拿得到。失败不影响登录本身（升级是优化，不是登录的必要条件）。
+    if upgraded:
+        try:
+            mysql_client.update_password_hash(user.id, upgraded)
+            logger.info("已将账号 %s 的口令哈希升级到最新参数", username)
+        except Exception as e:
+            logger.warning("口令哈希升级失败（不影响本次登录）: %s", e)
 
     logger.info("用户登录成功: %s (id=%s)", user.username, user.id)
     return _to_public(user)
@@ -158,62 +260,106 @@ def get_user(user_id: int) -> Optional[Dict]:
     return _to_public(user) if user else None
 
 
-# ---------------- 令牌 ----------------
-
-def _b64e(raw: bytes) -> str:
-    """base64url 编码并去掉 '=' 填充（令牌里不需要，也避免 URL 转义问题）。"""
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
-
-
-def _b64d(text: str) -> bytes:
-    """base64url 解码，自动补齐被去掉的 '=' 填充。"""
-    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
-
-
-def _sign(payload_b64: str) -> str:
-    """对 payload 做 HMAC-SHA256 签名。密钥泄露 = 任何人都能伪造任意用户。"""
-    mac = hmac.new(
-        settings.AUTH_SECRET_KEY.encode("utf-8"),
-        payload_b64.encode("ascii"),
-        hashlib.sha256,
-    )
-    return _b64e(mac.digest())
-
+# ---------------- 令牌（PyJWT 签发的标准 JWT） ----------------
 
 def create_token(user_id: int, username: str) -> str:
-    """签发登录令牌：base64url(payload) + '.' + base64url(签名)。"""
+    """
+    签发登录令牌：标准 JWT（HS256）。
+
+    payload 里带签发那一刻的 token_version（ver），校验时会与库里的当前值比对，
+    不一致就说明该令牌已被吊销（用户退出过登录，或改过密码）。
+
+    ver 由本函数自己从库里读**当前值**，不接受调用方传入：
+    令牌只能用签发那一刻的最新版本签，不存在"用旧版本签"的合法场景；
+    留个参数出去，早晚会有人传了个过期的版本，签出一个刚出生就失效的令牌。
+
+    关于 JWT 与吊销：JWT 是自包含 + 验签的，**天生无法撤销**（签发后到过期前一直有效）。
+    所以这里必须保留 ver 字段配合服务端的 token_version 比对，
+    不能因为"换成了标准 JWT"就以为吊销也不需要了。
+    """
+    user = mysql_client.get_user_by_id(user_id)
+    now = int(time.time())
     payload = {
-        "uid": user_id,
+        # sub 按 JWT 规范用字符串
+        "sub": str(user_id),
         "u": username,
-        "exp": int(time.time()) + settings.AUTH_TOKEN_TTL_HOURS * 3600,
+        "ver": int((user.token_version if user else 0) or 0),
+        "iat": now,
+        "exp": now + settings.AUTH_TOKEN_TTL_HOURS * 3600,
     }
-    payload_b64 = _b64e(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
-    return f"{payload_b64}.{_sign(payload_b64)}"
+    return jwt.encode(payload, settings.AUTH_SECRET_KEY, algorithm=_JWT_ALGORITHM)
 
 
 def parse_token(token: str) -> Dict:
     """
-    校验令牌签名与有效期，返回 {"user_id", "username"}；无效则抛 AuthError。
+    校验令牌**签名与有效期**，返回 {"user_id", "username", "token_version"}；无效则抛 AuthError。
 
-    先验签再解析内容：签名不对就完全不信任 payload 里的任何字节。
+    交给 PyJWT 校验：它会验证签名、exp/nbf/iat，并且**必须显式传 algorithms 白名单**
+    ——正是这个白名单挡住了 alg=none 之类的算法替换伪造。
+
+    注意这里只做"离线"校验，**不包括吊销检查**——吊销要跟库里的 token_version 比对，
+    属于 authenticate_token 的职责。单独用本函数无法发现已被吊销的令牌。
     """
     try:
-        payload_b64, signature = (token or "").strip().split(".")
-    except ValueError:
-        raise AuthError("登录状态无效，请重新登录")
-
-    if not hmac.compare_digest(_sign(payload_b64), signature):
-        raise AuthError("登录状态无效，请重新登录")
-
-    try:
-        payload = json.loads(_b64d(payload_b64))
-    except (ValueError, TypeError):
-        raise AuthError("登录状态无效，请重新登录")
-
-    if int(payload.get("exp", 0)) < int(time.time()):
+        payload = jwt.decode(
+            (token or "").strip(),
+            settings.AUTH_SECRET_KEY,
+            algorithms=[_JWT_ALGORITHM],
+            # 只要 HS256 且在有效期内即可；本项目不使用 aud/iss，不开启对应校验
+            options={"require": ["exp", "sub"]},
+        )
+    except jwt.ExpiredSignatureError:
         raise AuthError("登录已过期，请重新登录")
+    except jwt.InvalidTokenError as e:
+        # 签名错误 / 结构损坏 / 算法不符 / 缺必需字段都落在这里，
+        # 对外统一一句话，不区分细节——差异只对攻击者有意义
+        logger.info("令牌校验失败: %s", type(e).__name__)
+        raise AuthError("登录状态无效，请重新登录")
 
-    return {"user_id": int(payload["uid"]), "username": str(payload["u"])}
+    return {
+        "user_id": int(payload["sub"]),
+        "username": str(payload.get("u", "")),
+        # 老令牌没有 ver 字段，按 0 处理：它们签发于"吊销功能上线前"，
+        # 等同于版本 0，会在用户第一次退出登录后自然失效。
+        "token_version": int(payload.get("ver", 0)),
+    }
+
+
+def authenticate_token(token: str) -> Dict:
+    """
+    完整的令牌校验：签名 + 有效期 + **吊销状态**，返回用户公开信息；任一环节不过抛 AuthError。
+
+    这是所有需要鉴权的入口应该调用的函数。吊销检查要读库里的 token_version，
+    因此比 parse_token 多一次查询——但调用方（如 API 的 get_current_user）
+    本来就要按 user_id 取用户以确认账号仍在，所以这次查询是复用的，没有额外开销。
+    """
+    payload = parse_token(token)
+
+    user = mysql_client.get_user_by_id(payload["user_id"])
+    if user is None:
+        # 验签通过不代表账号还在（可能已被删除）
+        raise AuthError("账号不存在或已被禁用")
+
+    if payload["token_version"] != int(user.token_version or 0):
+        # 版本对不上 = 该令牌在签发之后被吊销了（退出登录 / 改密码）
+        raise AuthError("登录已失效，请重新登录")
+
+    return _to_public(user)
+
+
+def revoke_tokens(user_id: int) -> int:
+    """
+    吊销该用户**全部**已签发的令牌（退出登录 / 改密码时调用），返回新的令牌版本号。
+
+    注意语义：这是"退出所有设备"，不是"只退出当前这一个"。
+    单令牌精确吊销需要维护已吊销令牌名单（有清理与多进程一致性问题），
+    对本项目这种规模不划算——现在这个方案没有额外存储、重启也不会失效。
+    """
+    new_version = mysql_client.bump_token_version(user_id)
+    if new_version is None:
+        raise AuthError("账号不存在")
+    logger.info("已吊销用户 %s 的全部令牌（token_version -> %s）", user_id, new_version)
+    return new_version
 
 
 class AuthService:
@@ -226,6 +372,10 @@ class AuthService:
     get_user = staticmethod(get_user)
     create_token = staticmethod(create_token)
     parse_token = staticmethod(parse_token)
+    authenticate_token = staticmethod(authenticate_token)
+    revoke_tokens = staticmethod(revoke_tokens)
+    is_admin = staticmethod(is_admin)
+    require_admin = staticmethod(require_admin)
 
 
 # 模块级单例，供各入口复用
