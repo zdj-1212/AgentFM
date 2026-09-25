@@ -1,7 +1,11 @@
 [project]
 name = "agentfm"
 version = "0.1.0"
+description = "基于 LangGraph 多智能体 + RAG 的企业智能客服系统（含用户体系、数据隔离、转人工）"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "zdj-1212" }]
 dependencies = [
     "fastapi>=0.141.1",
     "langchain>=1.4.0",
@@ -11,20 +15,12 @@ dependencies = [
     "pydantic-settings>=2.15.0",
     "pyjwt>=2.14.0",
     "pymilvus>=3.0.1",
+
     "pymysql>=1.2.0",
-    "python-dotenv>=1.2.3",
     "redis>=6.0.0",
-    "sentence-transformers>=6.0.1",
     "sqlalchemy>=2.0.52",
     "streamlit>=1.63.0",
     "uvicorn[standard]>=0.52.4",
 ]
 
-[[tool.uv.index]]
-url = "https://mirrors.aliyun.com/pypi/simple/"
-default = true
 
-[dependency-groups]
-dev = [
-    "pytest>=9.1.1",
-]

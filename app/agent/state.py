@@ -65,6 +65,28 @@ class ErrorCode(str,Enum):
     GENERAL_UNAVAILABLE = "general_unavailable"      # 综合兜底 Agent 失败
     CHITCHAT_UNAVAILABLE = "chitchat_unavailable"    # 闲聊节点失败（通常是 LLM）
 
+class HandoffStatus(str,Enum):
+    """会话的"谁在应答"状态（转人工的状态机）。
+
+    放在这里是因为它既是会话数据（conversations.handoff_status 列），
+    也直接决定 Agent 图的行为：只有 BOT 状态下才允许机器人作答。
+    图本身不修改它（改状态是服务层的事），但必须尊重它。
+
+    - BOT      : 机器人应答（默认）
+    - PENDING  : 用户已请求转人工，等待坐席接入
+    - ASSIGNED : 已有坐席接入并处理中
+    - CLOSED   : 本次转人工已结束，交回机器人
+    """
+
+    BOT = "bot"
+    PENDING = "pending"
+    ASSIGNED = "assigned"
+    CLOSED = "closed"
+
+
+# 机器人可以作答的状态：BOT 与 CLOSED（关闭后可继续提问）
+BOT_ANSWER_STATUSES = (HandoffStatus.BOT.value, HandoffStatus.CLOSED.value)
+
 class AgentState(TypedDict):
     """Agent 图全局状态（所有节点共享的"黑板"）。
 

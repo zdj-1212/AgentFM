@@ -20,9 +20,9 @@ def main() -> None:
 
     count = ingest(reset=args.reset)
     if count > 0:
-        logger.info("✅ 知识库入库完成，本次写入 %s 条", count)
+        logger.info("知识库入库完成，本次写入 %s 条", count)
     else:
-        logger.warning("⚠️ 未写入任何数据，请检查 corpus 目录")
+        logger.warning("未写入任何数据，请检查 corpus 目录")
 
 
 if __name__ == "__main__":

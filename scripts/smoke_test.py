@@ -14,8 +14,10 @@
      **Redis 不可用时必须退化**（限流回进程内、检索不走缓存），不能因此报错
   9. 角色与反馈：注册不能自封管理员；普通用户访问运营接口一律 403；
      评价只能打自己会话里的助手回复（管理员也不行，运营台只读）
-  10. 降级可辨识：节点失败时 error_code 必须透出，闲聊历史必须是原文
-  11. LangGraph 工作流：四种路由 + 会话标题概括 + 历史落库
+  10. 转人工：bot -> pending -> assigned -> closed；机器人停止作答、认领互斥，
+      管理员与普通用户都进不了坐席入口
+  11. 降级可辨识：节点失败时 error_code 必须透出，闲聊历史必须是原文
+  12. LangGraph 工作流：四种路由 + 会话标题概括 + 历史落库
 
 测试可反复执行：过程中创建的临时账号与会话会在结束时自动清理，不会污染演示数据。
 
@@ -177,6 +179,133 @@ ADMIN_ONLY_PATHS = [
     "/admin/feedback/summary",
     "/admin/users/1/sessions",
 ]
+
+
+AGENT_USER = ("客服小李", "123456")
+
+
+def check_handoff() -> None:
+    """
+    验证转人工的完整状态机：bot -> pending -> assigned -> closed。
+
+    重点覆盖三类容易"看起来实现了、实际没生效"的问题：
+    1. **机器人必须闭嘴**：转人工之后 ask() 不能再作答（否则人工和机器人对着同一个人抢话），
+       但用户补发的消息仍要入库——坐席得看得到；
+    2. **认领必须互斥**：两个坐席同时抢一个会话，只能有一个人成功；
+    3. **权限边界**：普通用户和管理员都不能接入/回复（管理员是只读的运营视角，
+       这是他选择"职责分离"的核心），坐席之间也不能互相插话。
+    """
+    from fastapi.testclient import TestClient
+
+    from app.api_server import app
+    from app.core.rate_limit import auth_limiter
+
+    auth_limiter.reset()
+    client = TestClient(app)
+
+    def bearer(token: str) -> dict:
+        return {"Authorization": f"Bearer {token}"}
+
+    def login(username: str, password: str = "123456") -> str:
+        r = client.post("/auth/login", json={"username": username, "password": password})
+        assert r.status_code == 200, f"{username} 登录失败: {r.text}"
+        return r.json()["access_token"]
+
+    agent_token = login(*AGENT_USER)
+    member_name = "hf_" + uuid.uuid4().hex[:8]
+    member = auth_service.register(member_name, "secret123")
+    member_token = client.post(
+        "/auth/login", json={"username": member_name, "password": "secret123"}
+    ).json()["access_token"]
+    admin_token = login(*ADMIN_USER)
+
+    session_id = None
+    try:
+        # 先正常问一句，确认机器人此时是会答题的
+        session_id = chat_service.create_session(member["user_id"], member["display_name"])
+        first = chat_service.ask(session_id, "你好，在吗？", member["user_id"], member["display_name"])
+        assert first["handoff_status"] == "bot", f"初始状态应为 bot: {first['handoff_status']}"
+        assert first["reply"], "转人工前机器人应当正常作答"
+
+        # 1) 用户请求转人工
+        r = client.post(f"/sessions/{session_id}/handoff", headers=bearer(member_token))
+        assert r.status_code == 200, f"转人工失败: {r.status_code} {r.text}"
+        assert r.json()["handoff_status"] == "pending", f"状态应为 pending: {r.json()}"
+        print("  [转人工] 用户请求成功 -> pending")
+
+        # 2) 机器人必须闭嘴，但消息仍要入库给坐席看
+        before = mysql_client.count_messages(session_id)
+        after_handoff = chat_service.ask(
+            session_id, "我还想补充一句：订单号是 SO20260901001", member["user_id"], member["display_name"]
+        )
+        assert after_handoff["handoff_status"] == "pending", "转人工后状态应保持 pending"
+        assert not after_handoff["reply"], f"转人工后机器人不应作答，实际: {after_handoff['reply'][:40]}"
+        assert mysql_client.count_messages(session_id) == before + 1, "用户补发的消息必须入库"
+        print("  [转人工] 机器人已停止作答，但用户补发的消息仍入库")
+
+        # 3) 权限：普通用户与管理员都不能进坐席队列
+        assert client.get("/agent/queue", headers=bearer(member_token)).status_code == 403
+        assert client.get("/agent/queue", headers=bearer(admin_token)).status_code == 403, \
+            "管理员不该能进坐席队列（运营台只读）"
+        print("  [转人工] 普通用户与管理员访问坐席队列均 403")
+
+        # 坐席可以看到待接入队列
+        q = client.get("/agent/queue", headers=bearer(agent_token)).json()
+        assert any(s["session_id"] == session_id for s in q["pending"]), "待接入队列里没有该会话"
+        assert not any(s["session_id"] == session_id for s in q["mine"]), "未接入却出现在我的列表里"
+        print(f"  [转人工] 坐席可见待接入队列（{len(q['pending'])} 个）")
+
+        # 4) 未接入前不能回复
+        r = client.post(f"/agent/sessions/{session_id}/reply",
+                        json={"content": "我先抢答一下"}, headers=bearer(agent_token))
+        assert r.status_code == 403, f"未接入就回复应 403，实际 {r.status_code}"
+
+        # 5) 并发认领：只有一个人能成功
+        from concurrent.futures import ThreadPoolExecutor
+
+        def try_claim(_):
+            return client.post(f"/agent/sessions/{session_id}/claim",
+                               headers=bearer(agent_token)).status_code
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            results = list(pool.map(try_claim, range(5)))
+        assert 200 in results, f"至少应有一次认领成功: {results}"
+        conv = mysql_client.get_conversation(session_id)
+        assert conv.handoff_status == "assigned", f"认领后应为 assigned: {conv.handoff_status}"
+        assert conv.agent_id == member_of_agent(), f"接待坐席应记录正确: {conv.agent_id}"
+        print(f"  [转人工] 并发认领 {results.count(200)} 次成功、{results.count(403)} 次被拒，状态 -> assigned")
+
+        # 6) 坐席回复 -> 以 role='agent' 落库，用户历史里能看到
+        r = client.post(f"/agent/sessions/{session_id}/reply",
+                        json={"content": "已收到，正在为您核实订单"}, headers=bearer(agent_token))
+        assert r.status_code == 200, f"坐席回复失败: {r.status_code} {r.text}"
+        history = chat_service.get_history(session_id, member["user_id"])
+        agent_msgs = [h for h in history if h["role"] == "agent"]
+        assert agent_msgs and "正在为您核实" in agent_msgs[-1]["content"], "用户看不到坐席回复"
+        print("  [转人工] 坐席回复落库为 role='agent'，用户侧可见")
+
+        # 7) 管理员依然不能代坐席回复（保留"运营台只读"这条不变量）
+        r = client.post(f"/agent/sessions/{session_id}/reply",
+                        json={"content": "管理员插一句"}, headers=bearer(admin_token))
+        assert r.status_code == 403, f"管理员代回复应 403，实际 {r.status_code}"
+        print("  [转人工] 管理员仍不能代坐席回复（运营台只读）")
+
+        # 8) 结束人工服务 -> 交回机器人，机器人恢复作答
+        r = client.post(f"/agent/sessions/{session_id}/close", headers=bearer(agent_token))
+        assert r.status_code == 200 and r.json()["handoff_status"] == "closed", f"结束失败: {r.text}"
+        resumed = chat_service.ask(session_id, "你好，在吗？", member["user_id"], member["display_name"])
+        assert resumed["reply"], "结束人工服务后机器人应恢复作答"
+        print("  [转人工] 结束 -> closed，机器人恢复作答")
+    finally:
+        if session_id:
+            mysql_client.delete_conversation(session_id)
+        mysql_client.delete_user(member["user_id"])
+        auth_limiter.reset()
+
+
+def member_of_agent() -> int:
+    """取演示坐席的 user_id（用于断言会话归属到了正确的坐席）。"""
+    u = mysql_client.get_user_by_username(AGENT_USER[0])
+    return u.id if u else -1
 
 
 def check_redis() -> None:
@@ -363,7 +492,7 @@ def check_roles_and_feedback() -> None:
             if u["user_id"] == user_id
         )
         assert row["up"] == 1 and row["down"] == 0, f"运营总览未反映评价: {row}"
-        print(f"  [反馈] 运营总览已反映：👍 {row['up']} / 👎 {row['down']} / 消息 {row['messages']}")
+        print(f"  [反馈] 运营总览已反映：{row['up']} / {row['down']} / 消息 {row['messages']}")
 
         # 6) 取消评价（feedback=null）应把计数清掉
         r = client.post(
@@ -684,31 +813,33 @@ def main() -> None:
     print("AgentFM 端到端冒烟测试")
     print("=" * 60)
 
-    print("[1/11] 检查 MySQL ...")
+    print("[1/12] 检查 MySQL ...")
     check_mysql()
-    print("[2/11] 检查认证 ...")
+    print("[2/12] 检查认证 ...")
     user = check_auth()
-    print("[3/11] 检查数据隔离 ...")
+    print("[3/12] 检查数据隔离 ...")
     check_isolation(user)
-    print("[4/11] 检查 Milvus 知识库 ...")
+    print("[4/12] 检查 Milvus 知识库 ...")
     check_milvus()
-    print("[5/11] 检查检索相关性 ...")
+    print("[5/12] 检查检索相关性 ...")
     check_retrieval()
-    print("[6/11] 检查认证限流 ...")
+    print("[6/12] 检查认证限流 ...")
     check_rate_limit()
-    print("[7/11] 检查令牌吊销 ...")
+    print("[7/12] 检查令牌吊销 ...")
     check_token_revocation()
-    print("[8/11] 检查 Redis 加速层 ...")
+    print("[8/12] 检查 Redis 加速层 ...")
     check_redis()
-    print("[9/11] 检查角色与反馈 ...")
+    print("[9/12] 检查角色与反馈 ...")
     check_roles_and_feedback()
-    print("[10/11] 检查降级可辨识 ...")
+    print("[10/12] 检查转人工 ...")
+    check_handoff()
+    print("[11/12] 检查降级可辨识 ...")
     check_degradation(user)
-    print("[11/11] 检查 LangGraph 工作流 ...")
+    print("[12/12] 检查 LangGraph 工作流 ...")
     check_graph(user)
 
     print("=" * 60)
-    print("✅ 全部通过！可运行: uv run streamlit run app/streamlit_app.py")
+    print("全部通过！可运行: uv run streamlit run app/streamlit_app.py")
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ logger = get_logger(__name__)
 
 
 def overview(user: Optional[Dict]) -> List[Dict]:
-    """运营总览：每个用户的会话数、消息数、👍/👎 数（管理员可见）。"""
+    """运营总览：每个用户的会话数、消息数、有用/没用数（管理员可见）。"""
     require_admin(user)
     return mysql_client.user_feedback_stats()
 
@@ -73,7 +73,7 @@ def session_messages(user: Optional[Dict], session_id: str) -> List[Dict]:
 
 
 def feedback_summary(user: Optional[Dict]) -> Dict:
-    """反馈汇总：整体 👍/👎 比例与"最近被踩的回复"，用于定位答得不好的地方。"""
+    """反馈汇总：整体的有用/没用比例，用于定位答得不好的地方。"""
     require_admin(user)
 
     rows = mysql_client.user_feedback_stats()

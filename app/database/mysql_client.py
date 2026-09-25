@@ -65,6 +65,10 @@ class Conversation(Base):
     user_id 是数据隔离的依据：侧边栏只列当前用户的会话，且按 session_id 取历史时也要校验归属。
     声明为 Optional 是为了与"给已有表加列"的 ALTER（只能先加 NULL 列）保持一致，
     非空约束由 DAO 层保证（create_conversation 必须传 user_id）。
+
+    转人工（handoff_status / agent_id）是**会话级**状态，不是消息级：
+    一个会话在任一时刻只会处于"机器人应答 / 等待坐席 / 坐席处理中 / 已关闭"之一，
+    用状态机表达比在每条消息上打标记更不容易出现自相矛盾的状态。
     """
     __tablename__ = "conversations"
     id:Mapped[int] = mapped_column(primary_key=True,autoincrement=True)
@@ -72,13 +76,20 @@ class Conversation(Base):
     user_id:Mapped[Optional[int]] = mapped_column(Integer,index=True,nullable=True)
     user_name:Mapped[str] = mapped_column(String(64),default="游客")
     title: Mapped[str] = mapped_column(String(255),default="新会话")
+    # bot / pending / assigned / closed，见 app/agent/state.py 的 HandoffStatus
+    handoff_status: Mapped[str] = mapped_column(
+        String(16), default="bot", server_default="bot", index=True
+    )
+    # 当前接待的坐席（users.id）；未接入时为 NULL。
+    # 认领用"带条件的原子 UPDATE"实现，所以这个字段同时就是并发互斥的凭据。
+    agent_id: Mapped[Optional[int]] = mapped_column(Integer, index=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime,default=datetime.now)
     updated_at: Mapped[datetime] = mapped_column(DateTime,default=datetime.now,onupdate=datetime.now)
 
 class Message(Base):
     """消息表：会话内每条消息（user / assistant）。
 
-    feedback 是用户对**助手回复**的评价：1=👍，-1=👎，NULL=未评价。
+    feedback 是用户对**助手回复**的评价：1=，-1=，NULL=未评价。
     用户消息不会有评价，所以这两个字段对 role='user' 的行恒为 NULL。
     反馈攒起来就是最有价值的东西——它是后面做评测集、判断"哪类问题答不好"的原始信号。
     """
@@ -265,6 +276,19 @@ def init_db():
         "role",
         "ALTER TABLE users ADD COLUMN role VARCHAR(16) NOT NULL DEFAULT 'user'",
     )
+    # 转人工：会话级状态 + 接待坐席
+    _ensure_column(
+        "conversations",
+        "handoff_status",
+        "ALTER TABLE conversations ADD COLUMN handoff_status VARCHAR(16) NOT NULL DEFAULT 'bot', "
+        "ADD INDEX idx_conv_handoff (handoff_status)",
+    )
+    _ensure_column(
+        "conversations",
+        "agent_id",
+        "ALTER TABLE conversations ADD COLUMN agent_id INT NULL, "
+        "ADD INDEX idx_conv_agent (agent_id)",
+    )
     # 答案反馈：可空，未评价即 NULL
     _ensure_column(
         "messages", "feedback", "ALTER TABLE messages ADD COLUMN feedback INT NULL"
@@ -424,6 +448,53 @@ def list_conversations_by_user_ids(user_ids: List[int], limit: int = 50) -> List
             .all()
         )
 
+def set_handoff_status(
+    session_id: str,
+    status: str,
+    agent_id: Optional[int] = None,
+    from_statuses: Optional[List[str]] = None,
+) -> bool:
+    """
+    更新会话的转人工状态。返回是否真的改到了行。
+
+    传 from_statuses 时是"带条件的更新"（CAS）：只有当前状态在允许集合里才生效。
+    这是防止状态被并发改乱的关键——例如两个坐席同时认领，只有一个人能成功。
+    """
+    with session_scope() as s:
+        q = s.query(Conversation).filter(Conversation.session_id == session_id)
+        if from_statuses:
+            q = q.filter(Conversation.handoff_status.in_(from_statuses))
+        affected = q.update(
+            {Conversation.handoff_status: status, Conversation.agent_id: agent_id},
+            synchronize_session=False,
+        )
+        return bool(affected)
+
+def list_conversations_by_status(statuses: List[str], limit: int = 50) -> List[Conversation]:
+    """按转人工状态列出会话（坐席的待接入队列用），按最后更新倒序。"""
+    with session_scope() as s:
+        return (
+            s.query(Conversation)
+            .filter(Conversation.handoff_status.in_(statuses))
+            .order_by(Conversation.updated_at.desc())
+            .limit(limit)
+            .all()
+        )
+
+def list_conversations_by_agent(agent_id: int, statuses: List[str], limit: int = 50) -> List[Conversation]:
+    """列出某坐席名下的会话。"""
+    with session_scope() as s:
+        return (
+            s.query(Conversation)
+            .filter(
+                Conversation.agent_id == agent_id,
+                Conversation.handoff_status.in_(statuses),
+            )
+            .order_by(Conversation.updated_at.desc())
+            .limit(limit)
+            .all()
+        )
+
 def touch_conversation(session_id: str, title: str = None, user_id: Optional[int] = None) -> None:
     """更新会话的更新时间（每次问答后调用）；传 title 时一并更新标题。
 
@@ -488,7 +559,7 @@ def set_message_feedback(
     note: Optional[str] = None,
 ) -> bool:
     """
-    给某条助手消息写评价（1=👍 / -1=👎 / None=取消评价）。
+    给某条助手消息写评价（1=/ -1=/ None=取消评价）。
 
     归属校验直接写进 UPDATE 的 WHERE 里（messages 关联 conversations 再比对 user_id）：
     用一条语句同时完成"校验 + 写入"，比"先查出来判断、再更新"更不容易被绕过——
@@ -538,10 +609,10 @@ def get_message(message_id: int) -> Optional[Message]:
 
 def user_feedback_stats() -> List[Dict]:
     """
-    按用户汇总：会话数、消息数、👍 数、👎 数。供管理员总览页使用。
+    按用户汇总：会话数、消息数、数、数。供管理员总览页使用。
 
     用一次 GROUP BY 查询取全量，而不是"先列用户再逐个用户查三遍"（N+1）。
-    👍/👎 只统计助手消息上的评价。
+   /只统计助手消息上的评价。
     """
     with session_scope() as s:
         conversations = dict(
@@ -626,17 +697,21 @@ DEMO_USERS = [
     ("张三", "张三"),
     ("李四", "李四"),
     ("王五", "王五"),
+    # 坐席账号：转人工功能需要有人"接入"，单独一个账号比让普通用户兼任更清楚
+    ("客服小李", "客服小李"),
 ]
 DEMO_PASSWORD = "123456"
 
-# 演示管理员：能看到所有人的会话与反馈（运营视角）。
-# 张三既是订单演示账号也是管理员，这样用同一个账号就能同时演示"我的会话"和"运营总览"；
-# 李四/王五保持普通用户，用来验证隔离对普通用户依然严格。
+# 演示角色分配：三种角色各一个账号，方便分别登录体验。
+# 张三同时是订单归属人，用同一个账号就能演示"我的会话"和"运营总览"；
+# 李四/王五保持普通用户，用来验证隔离对普通用户依然严格；
+# 客服小李是坐席，只会看到等待接入的会话与自己名下的会话。
 DEMO_ADMIN_USERNAME = "张三"
+DEMO_AGENT_USERNAME = "客服小李"
 
 
 def seed_demo_users() -> None:
-    """写入演示账号（幂等：已存在的用户名跳过），并把演示管理员提升为 admin。"""
+    """写入演示账号（幂等：已存在的用户名跳过），并修正演示账号的角色。"""
     from app.services.auth_service import hash_password  # 延迟导入，避免与 services 层循环依赖
 
     created = 0
@@ -651,24 +726,35 @@ def seed_demo_users() -> None:
                     password_hash=hash_password(DEMO_PASSWORD),
                     display_name=display_name,
                     # 角色在种子里显式指定；注册接口永远走默认的 'user'
-                    role="admin" if username == DEMO_ADMIN_USERNAME else "user",
+                    role=_demo_role(username),
                 )
             )
             created += 1
 
-        # 已存在的演示管理员也要补上角色：否则在"角色功能上线前"就已经建好的库里，
-        # 张三会一直停留在 user，运营总览页根本进不去。
-        promoted = (
-            s.query(User)
-            .filter(User.username == DEMO_ADMIN_USERNAME, User.role != "admin")
-            .update({User.role: "admin"}, synchronize_session=False)
-        )
+        # 已存在的演示账号也要补上角色：否则在"角色功能上线前"就已经建好的库里，
+        # 张三会一直停留在 user（进不去运营总览）、客服小李也当不上坐席。
+        promoted = 0
+        for username in (DEMO_ADMIN_USERNAME, DEMO_AGENT_USERNAME):
+            promoted += (
+                s.query(User)
+                .filter(User.username == username, User.role != _demo_role(username))
+                .update({User.role: _demo_role(username)}, synchronize_session=False)
+            )
     if created:
         logger.info("已创建 %s 个演示账号（密码均为 %s）", created, DEMO_PASSWORD)
     else:
         logger.info("演示账号已存在，跳过初始化")
     if promoted:
-        logger.info("已将演示管理员 %s 的角色设为 admin", DEMO_ADMIN_USERNAME)
+        logger.info("已修正演示账号的角色（管理员/坐席）")
+
+
+def _demo_role(username: str) -> str:
+    """演示账号 → 角色。只有这两个名字有特殊角色，其余一律普通用户。"""
+    if username == DEMO_ADMIN_USERNAME:
+        return "admin"
+    if username == DEMO_AGENT_USERNAME:
+        return "agent"
+    return "user"
 
 
 def seed_demo_data() -> None:

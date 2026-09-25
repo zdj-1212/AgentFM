@@ -22,7 +22,7 @@ from typing import Dict,List,Optional
 
 from app.agent.graph import get_graph
 from app.agent.prompts import TITLE_SUMMARY_PROMPT
-from app.agent.state import Intent
+from app.agent.state import BOT_ANSWER_STATUSES, HandoffStatus, Intent
 from app.core.logger import get_logger
 from app.database import mysql_client
 
@@ -75,6 +75,7 @@ class ChatService:
 
         会话不属于该用户时抛 PermissionError，避免"知道 session_id 就能读别人对话"。
         带上 message_id 与已有评价，前端才能渲染出"这条我赞过/踩过"的状态。
+        坐席（role='agent'）的回复同样会出现在这里——用户必须看得到人工说了什么。
         """
         if mysql_client.get_conversation(session_id, user_id) is None:
             raise PermissionError("会话不存在或无权访问")
@@ -90,6 +91,62 @@ class ChatService:
             for m in mysql_client.get_recent_messages(session_id, limit=100)
         ]
 
+    # ---------------- 转人工（用户侧） ----------------
+
+    def get_session_state(self, session_id: str, user_id: int) -> Dict:
+        """
+        返回会话的转人工状态与当前坐席，供前端决定展示什么
+        （是普通的输入框，还是"等待坐席接入"的提示）。
+
+        会话不属于该用户时抛 PermissionError。
+        """
+        conv = mysql_client.get_conversation(session_id, user_id)
+        if conv is None:
+            raise PermissionError("会话不存在或无权访问")
+
+        agent_name = ""
+        if conv.agent_id:
+            agent = mysql_client.get_user_by_id(conv.agent_id)
+            if agent:
+                agent_name = agent.display_name or agent.username
+
+        return {
+            "session_id": session_id,
+            "handoff_status": conv.handoff_status or HandoffStatus.BOT.value,
+            "agent_id": conv.agent_id,
+            "agent_name": agent_name,
+        }
+
+    def request_handoff(self, session_id: str, user_id: int) -> Dict:
+        """
+        用户请求转人工：把会话从 bot 置为 pending，进入坐席的待接入队列。
+
+        用带条件的更新（只允许从 bot/closed 转过来），所以重复点按钮不会把
+        "已被坐席接入"的会话打回队列——那会把正在处理中的会话从坐席手里抢走。
+        """
+        conv = mysql_client.get_conversation(session_id, user_id)
+        if conv is None:
+            raise PermissionError("会话不存在或无权访问")
+
+        current = conv.handoff_status or HandoffStatus.BOT.value
+        if current == HandoffStatus.PENDING.value:
+            return self.get_session_state(session_id, user_id)  # 已经在队列里，幂等
+        if current == HandoffStatus.ASSIGNED.value:
+            return self.get_session_state(session_id, user_id)  # 已有坐席，不打断
+
+        ok = mysql_client.set_handoff_status(
+            session_id,
+            HandoffStatus.PENDING.value,
+            agent_id=None,
+            from_statuses=list(BOT_ANSWER_STATUSES),
+        )
+        if ok:
+            logger.info("[handoff] 用户请求转人工: session=%s user_id=%s", session_id, user_id)
+        else:
+            # 并发下被别人改掉了，以库里的实际状态为准
+            logger.info("[handoff] 状态未变更（并发更新）: session=%s", session_id)
+        return self.get_session_state(session_id, user_id)
+
     def set_feedback(
         self,
         session_id: str,
@@ -99,7 +156,7 @@ class ChatService:
         note: str = "",
     ) -> bool:
         """
-        给某条助手回复写评价（1=👍 / -1=👎 / None=取消）。
+        给某条助手回复写评价（1=/ -1=/ None=取消）。
 
         两道校验，缺一不可：
         1. 会话必须属于调用者（否则等于能给别人机器人的回答打标）；
@@ -153,20 +210,39 @@ class ChatService:
         # 2) 判断是不是首轮提问——必须在写入本条消息**之前**统计，否则永远是 False
         first_turn = mysql_client.count_messages(session_id) == 0
 
-        # 3) 落库用户消息
+        # 3) 落库用户消息。
+        #    注意这一步在"已转人工"的判断**之前**：坐席需要看到用户转人工之后补充说明的内容，
+        #    如果因为机器人不答就把消息丢掉，用户会觉得"我说了但坐席看不到"。
         mysql_client.add_message(session_id,role="user",content=message)
+
+        # 3.5) 已转人工时机器人闭嘴：只落库、不调模型。
+        #      这里必须拦，否则人工和机器人会对着同一个用户各说各话。
+        current = conv.handoff_status if conv else HandoffStatus.BOT.value
+        if current not in BOT_ANSWER_STATUSES:
+            logger.info("[ask] 会话处于转人工状态(%s)，机器人不介入: session=%s", current, session_id)
+            return {
+                "session_id": session_id,
+                "reply": "",
+                "intent": "handoff",
+                "sources": [],
+                "error_code": None,
+                "message_id": None,
+                "handoff_status": current,
+            }
 
         # 4) 首轮提问 -> 后台并行生成标题（不阻塞下面的 Agent 调用）
         title_future = None
         if first_turn and settings_title_enabled():
             title_future = _TITLE_POOL.submit(_summarize_title, message)
 
-        # 5) 读取最近历史（不含刚写入的这条，作为上下文）
+        # 5) 读取最近历史（不含刚写入的这条，作为上下文）。
+        #    人工（agent）说过的话也要计入：转人工结束、机器人重新接手后，
+        #    它得知道刚才坐席和用户聊了什么，否则会重复追问已经解决过的事。
         recent= mysql_client.get_recent_messages(session_id,limit=settings_history_window()*2)
         history=[
             {"role":m.role,"content":m.content}
             for m in recent
-            if m.role in ("user","assistant") and m.content != message
+            if m.role in ("user","assistant","agent") and m.content != message
         ]
         # 6) 构造状态并调用图
         state = {
@@ -210,6 +286,9 @@ class ChatService:
             "error_code": error_code,
             # 刚落库的助手消息 id，前端据此对这条回复展示评价按钮
             "message_id": result.get("message_id"),
+            # 当前会话的转人工状态；非 bot/closed 时 reply 为空，
+            # 调用方应当据此展示"等待坐席"而不是一条空白回复
+            "handoff_status": current,
         }
 
 

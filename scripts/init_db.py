@@ -20,7 +20,7 @@ def main() -> None:
     # init_db 内部依次完成：建库 -> 建表 -> 补列 -> 清理无主旧数据 -> 演示账号 -> 演示订单
     mysql_client.init_db()
 
-    logger.info("✅ 数据库初始化完成")
+    logger.info("数据库初始化完成")
 
 
 if __name__ == "__main__":

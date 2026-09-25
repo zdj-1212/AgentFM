@@ -286,7 +286,7 @@ def finalize_node(state: AgentState) -> Dict:
         mysql_client.touch_conversation(
             state["session_id"], user_id=state.get("user_id")
         )
-        # 把落库后的消息 id 带回状态：前端要立刻对"刚刚这条回复"展示 👍/👎，
+        # 把落库后的消息 id 带回状态：前端要立刻对"刚刚这条回复"展示/，
         # 有 id 才写得进去评价，否则得再查一次库才能拿到它。
         return {"message_id": saved.id}
     except Exception as e:

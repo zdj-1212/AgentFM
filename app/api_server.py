@@ -16,7 +16,13 @@ AgentFM REST API 服务（FastAPI）
     POST /chat                       对话（自动创建会话或续接指定会话）
     GET  /sessions                   当前用户的会话列表
     GET  /sessions/{sid}/messages    某会话历史
-    POST /sessions/{sid}/messages/{mid}/feedback   给助手回复打分（👍/👎）
+    POST /sessions/{sid}/messages/{mid}/feedback   给助手回复打分（/）
+    POST /sessions/{sid}/handoff     请求转人工（用户）
+    GET  /agent/queue                待接入队列 + 我名下的会话（仅坐席）
+    GET  /agent/sessions/{sid}/messages  会话消息（仅坐席，限待接入或本人会话）
+    POST /agent/sessions/{sid}/claim 接入会话（仅坐席）
+    POST /agent/sessions/{sid}/reply 以人工身份回复（仅坐席）
+    POST /agent/sessions/{sid}/close 结束人工服务（仅坐席）
     GET  /admin/overview             运营总览：各用户会话/消息/评价数（仅管理员）
     GET  /admin/feedback/summary     反馈汇总（仅管理员）
     GET  /admin/users/{uid}/sessions 指定用户的会话（仅管理员）
@@ -45,7 +51,7 @@ from pydantic import BaseModel,Field
 from app.core.logger import get_logger
 from app.core.rate_limit import allow_auth_attempt,record_auth_failure
 from app.database import mysql_client
-from app.services import admin_service
+from app.services import admin_service, agent_service
 from app.services.auth_service import AuthError,auth_service
 from app.services.chat_service import chat_service
 
@@ -138,6 +144,11 @@ class ChatResponse(BaseModel):
         None,
         description="降级原因。为空表示正常回复；非空表示本轮回复为兜底话术，"
         "取值见 knowledge_unavailable / order_unavailable / general_unavailable / chitchat_unavailable",
+    )
+    handoff_status: str = Field(
+        "bot",
+        description="会话的转人工状态。非 bot/closed 时 reply 为空——"
+        "消息已入库但机器人不介入，等待坐席处理",
     )
 
 class SessionItem(BaseModel):
@@ -252,7 +263,7 @@ def logout(user: Dict = Depends(get_current_user)):
 
 class FeedbackRequest(BaseModel):
     feedback: Optional[int] = Field(
-        ..., description="1=👍，-1=👎，null=取消评价"
+        ..., description="1=，-1=，null=取消评价"
     )
     note: Optional[str] = Field(None, description="可选的一句原因", max_length=255)
 
@@ -287,7 +298,7 @@ def set_feedback(
 
 @app.get("/admin/overview")
 def admin_overview(user: Dict = Depends(get_current_user)):
-    """运营总览：每个用户的会话数、消息数、👍/👎（仅管理员）。"""
+    """运营总览：每个用户的会话数、消息数、有用/没用数（仅管理员）。"""
     try:
         return admin_service.overview(user)
     except PermissionError as e:
@@ -344,7 +355,57 @@ def chat(req: ChatRequest, user: Dict = Depends(get_current_user)):
         intent=result["intent"],
         sources=[SourceItem(**s) for s in result.get("sources", [])],
         error_code=result.get("error_code"),
+        handoff_status=result.get("handoff_status", "bot"),
     )
+
+@app.post("/sessions/{session_id}/handoff")
+def request_handoff(session_id: str, user: Dict = Depends(get_current_user)):
+    """请求转人工：把会话放入坐席的待接入队列，之后机器人不再介入。"""
+    try:
+        return chat_service.request_handoff(session_id, user["user_id"])
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+
+# ---------------- 坐席接口（转人工的人工侧） ----------------
+
+class AgentReplyRequest(BaseModel):
+    content: str = Field(..., description="坐席回复内容", min_length=1, max_length=2000)
+
+
+def _agent_guard(callable_, *args):
+    """把坐席服务层的异常统一映射成 HTTP 状态码，避免每个端点重复写一遍。"""
+    try:
+        return callable_(*args)
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/agent/queue")
+def agent_queue(user: Dict = Depends(get_current_user)):
+    """坐席工作台：待接入队列 + 我名下的会话（仅坐席，管理员也不行）。"""
+    return _agent_guard(agent_service.queue, user)
+
+@app.get("/agent/sessions/{session_id}/messages")
+def agent_messages(session_id: str, user: Dict = Depends(get_current_user)):
+    """坐席查看会话消息（限待接入或本人名下）。"""
+    return _agent_guard(agent_service.session_messages, user, session_id)
+
+@app.post("/agent/sessions/{session_id}/claim")
+def agent_claim(session_id: str, user: Dict = Depends(get_current_user)):
+    """接入一个待处理会话。并发下只有一个人能接入成功。"""
+    return _agent_guard(agent_service.claim, user, session_id)
+
+@app.post("/agent/sessions/{session_id}/reply")
+def agent_reply(session_id: str, req: AgentReplyRequest, user: Dict = Depends(get_current_user)):
+    """以人工身份回复用户（只能回复自己名下的会话）。"""
+    return _agent_guard(agent_service.reply, user, session_id, req.content)
+
+@app.post("/agent/sessions/{session_id}/close")
+def agent_close(session_id: str, user: Dict = Depends(get_current_user)):
+    """结束人工服务，把会话交回机器人。"""
+    return _agent_guard(agent_service.close, user, session_id)
 
 @app.get("/sessions", response_model=List[SessionItem])
 def sessions(user: Dict = Depends(get_current_user)):

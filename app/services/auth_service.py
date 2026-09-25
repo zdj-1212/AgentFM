@@ -66,9 +66,36 @@ warnings.filterwarnings("ignore", category=jwt.InsecureKeyLengthWarning)
 # HMAC-SHA256 的建议密钥长度（RFC 7518 §3.2）
 _MIN_SECRET_BYTES = 32
 
+# 明确"已公开、等于没有鉴权"的密钥取值：空值，以及仓库里那串开发默认值。
+_INSECURE_SECRETS = {"", "agentfm-dev-secret-change-me"}
+
+
+def assert_secret_key_is_safe() -> None:
+    """
+    拒绝用公开的默认密钥启动。
+
+    AUTH_SECRET_KEY 是签发登录令牌的 HMAC 密钥：一旦它还是仓库里那串公开默认值，
+    **任何人都能伪造任意用户的登录令牌**，整套鉴权形同虚设。而"记得改掉"这件事靠
+    文档是管不住的（README 里写了好几遍也照样会被跳过），所以做成启动即失败。
+
+    只对"已知公开的取值"硬失败；自定义但偏短的密钥仍只警告（见 _warn_if_weak_secret）——
+    那已经是使用者的主动选择，不该由框架替他决定。
+    本地开发想用默认值，把 DEBUG 打开即可跳过。
+    """
+    secret = (settings.AUTH_SECRET_KEY or "").strip()
+    if settings.DEBUG:
+        return
+    if secret in _INSECURE_SECRETS:
+        raise RuntimeError(
+            "AUTH_SECRET_KEY 仍是公开的默认值（或为空）——任何人拿到这个值都能伪造登录令牌。\n"
+            "请生成一个随机密钥填进 .env：\n"
+            '    python -c "import secrets;print(secrets.token_urlsafe(48))"\n'
+            "仅在本地开发时可设 DEBUG=true 跳过这项检查。"
+        )
+
 
 def _warn_if_weak_secret() -> None:
-    """启动时检查一次令牌签名密钥的长度，过短就明确告知后果与改法。"""
+    """检查一次令牌签名密钥的长度，过短就明确告知后果与改法。"""
     secret = (settings.AUTH_SECRET_KEY or "").encode("utf-8")
     if len(secret) < _MIN_SECRET_BYTES:
         logger.warning(
@@ -79,6 +106,10 @@ def _warn_if_weak_secret() -> None:
         )
 
 
+# 在模块加载时执行，而不是等某个入口来调用：
+# 只要有人用到认证能力（API / 网页端 / CLI / 冒烟测试），配置不对就当场失败，
+# 不会出现"服务看着起来了、其实谁都能伪造令牌"这种最糟的情况。
+assert_secret_key_is_safe()
 _warn_if_weak_secret()
 
 # 用户名：字母 / 数字 / 下划线 / 中文，2~32 个字符
@@ -174,13 +205,30 @@ def _to_public(user) -> Dict:
 
 
 # 角色常量与判定
+#
+# 三种角色**职责分离**，互不包含：
+#   user  普通用户：提问、可请求转人工
+#   agent 坐席    ：接入待处理会话、以人工身份回复
+#   admin 管理员  ：运营总览（**只读**，不能代替坐席回复）
+#
+# admin 刻意不是"agent 的超集"：管理员掌握的是查看与分析能力，
+# 而不是冒充客服对用户说话的能力。两者合一会让一个被盗的管理员账号
+# 可以直接向任意用户发消息，风险面明显更大。
 ROLE_USER = "user"
+ROLE_AGENT = "agent"
 ROLE_ADMIN = "admin"
+
+_VALID_ROLES = (ROLE_USER, ROLE_AGENT, ROLE_ADMIN)
 
 
 def is_admin(user: Optional[Dict]) -> bool:
     """判断用户是否为管理员。缺失/未知角色一律当作普通用户（失败时收紧，而不是放宽）。"""
     return bool(user) and user.get("role") == ROLE_ADMIN
+
+
+def is_agent(user: Optional[Dict]) -> bool:
+    """判断用户是否为坐席。同样从严：角色缺失或未知都不算。"""
+    return bool(user) and user.get("role") == ROLE_AGENT
 
 
 def require_admin(user: Optional[Dict]) -> Dict:
@@ -194,6 +242,20 @@ def require_admin(user: Optional[Dict]) -> Dict:
     if not is_admin(user):
         logger.warning("越权访问管理员接口被拒绝: user=%s", (user or {}).get("username"))
         raise PermissionError("需要管理员权限")
+    return user
+
+
+def require_agent(user: Optional[Dict]) -> Dict:
+    """
+    坐席权限闸门：不是坐席就抛 PermissionError。
+
+    注意它**不放过管理员**——管理员进不了坐席的队列与回复入口，这是刻意的：
+    运营台只读，代客回复是坐席的职责。要调整这条边界，应该改的是角色定义，
+    而不是在这里给 admin 开后门。
+    """
+    if not is_agent(user):
+        logger.warning("越权访问坐席接口被拒绝: user=%s", (user or {}).get("username"))
+        raise PermissionError("需要坐席权限")
     return user
 
 
@@ -375,7 +437,9 @@ class AuthService:
     authenticate_token = staticmethod(authenticate_token)
     revoke_tokens = staticmethod(revoke_tokens)
     is_admin = staticmethod(is_admin)
+    is_agent = staticmethod(is_agent)
     require_admin = staticmethod(require_admin)
+    require_agent = staticmethod(require_agent)
 
 
 # 模块级单例，供各入口复用
