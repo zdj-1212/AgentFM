@@ -90,6 +90,24 @@ class Settings(BaseSettings):
     RETRIEVE_TOP_K: int = 4
     RETRIEVE_SCORE_THRESHOLD: float = 0.45  # 余弦相似度阈值
 
+    # ---------------- 混合检索与重排 ----------------
+    # 纯向量检索对"语义相近但用词不同"的问题很有效，但对**精确词面**不敏感：
+    # 用户问的是原文里出现的专有名词/型号/条款名时，向量可能反而排不过泛化的段落。
+    # 混合检索 = 稠密向量 + BM25 词面检索，再用 Milvus 的 ranker 融合（重排）。
+    HYBRID_ENABLED: bool = True
+    # 融合/重排策略：
+    #   rrf      —— Reciprocal Rank Fusion，只按名次融合，无需调权重（默认，稳妥）
+    #   weighted —— 按加权分数融合，可用下面两个权重调偏向
+    RERANK_STRATEGY: str = "rrf"
+    RRF_K: int = 60  # RRF 的平滑常数，越大越弱化头部名次的优势
+    HYBRID_DENSE_WEIGHT: float = 0.7  # 仅 weighted 策略生效
+    HYBRID_SPARSE_WEIGHT: float = 0.3
+    # 每条召回分支取多少个候选再融合（融合前多取一些，给重排留出空间）
+    HYBRID_CANDIDATES: int = 16
+    # BM25 需要分词：中文语料必须用中文分词器，否则按空白切分等于整段当一个词，
+    # 词面召回会形同虚设。可选 standard / chinese。
+    MILVUS_TEXT_ANALYZER: str = "chinese"
+
     # ---------------- 对话记忆 ----------------
     HISTORY_WINDOW: int = 6  # 携带最近几轮历史
 

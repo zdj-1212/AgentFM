@@ -8,16 +8,18 @@
   3. 数据隔离：会话与订单只能被本人看到（本次新增的核心断言）
   4. Milvus 连通性 + 知识库入库（为空时自动入库）
   5. 检索相关性：相关问句必须命中预期文档，不相关问句必须 0 命中
-  6. 认证限流：连续失败必须 429，且被挡时不再白跑口令哈希
-  7. 令牌吊销：退出登录后，之前签发的令牌必须立刻失效（401）
-  8. Redis（可选加速层）：限流计数与检索缓存确实生效；
+  6. 混合检索与重排：稠密 + BM25 融合生效，且**不相关问题仍然 0 命中**
+     （BM25 没有绝对分基准，语义门槛必须仍由稠密阈值来把）
+  7. 认证限流：连续失败必须 429，且被挡时不再白跑口令哈希
+  8. 令牌吊销：退出登录后，之前签发的令牌必须立刻失效（401）
+  9. Redis（可选加速层）：限流计数与检索缓存确实生效；
      **Redis 不可用时必须退化**（限流回进程内、检索不走缓存），不能因此报错
-  9. 角色与反馈：注册不能自封管理员；普通用户访问运营接口一律 403；
-     评价只能打自己会话里的助手回复（管理员也不行，运营台只读）
-  10. 转人工：bot -> pending -> assigned -> closed；机器人停止作答、认领互斥，
+  10. 角色与反馈：注册不能自封管理员；普通用户访问运营接口一律 403；
+      评价只能打自己会话里的助手回复（管理员也不行，运营台只读）
+  11. 转人工：bot -> pending -> assigned -> closed；机器人停止作答、认领互斥，
       管理员与普通用户都进不了坐席入口
-  11. 降级可辨识：节点失败时 error_code 必须透出，闲聊历史必须是原文
-  12. LangGraph 工作流：四种路由 + 会话标题概括 + 历史落库
+  12. 降级可辨识：节点失败时 error_code 必须透出，闲聊历史必须是原文
+  13. LangGraph 工作流：四种路由 + 会话标题概括 + 历史落库
 
 测试可反复执行：过程中创建的临时账号与会话会在结束时自动清理，不会污染演示数据。
 
@@ -623,9 +625,12 @@ def check_retrieval() -> None:
         assert expect in origin, (
             f"命中来源不对: {question} -> 第一名是 {top['title']!r}，期望包含 {expect!r}"
         )
+        # 分数含义随检索模式而变：纯向量是余弦相似度，混合检索是融合分。
+        # 都叫"相似度"会误导——融合分没有绝对含义，0.03 和余弦的 0.65 不是一回事。
+        label = "相似度" if top.get("score_kind") == "cosine" else "融合分"
         print(
             f"  [检索] {question[:16]} -> {top['title']} "
-            f"(相似度 {top['score']:.3f})，共 {len(hits)} 条"
+            f"({label} {top['score']:.3f})，共 {len(hits)} 条"
         )
 
 
@@ -698,6 +703,69 @@ def check_rate_limit() -> None:
     finally:
         settings.AUTH_RATE_LIMIT_IP_PER_MINUTE = 20
         auth_limiter.reset()
+
+
+def check_hybrid_retrieval() -> None:
+    """
+    验证混合检索（稠密 + BM25）+ 重排。
+
+    最关键的一条在最后：**混合检索不能让"不知道就说不知道"失效**。
+    BM25 没有绝对分基准，任何问句它都能返回几个"词面最像"的片段；
+    如果让稀疏分支的结果直接进最终答案，问"今天天气怎么样"也会捞回一堆
+    似是而非的知识库内容，模型就会开始编。所以门槛必须由稠密分支的相似度阈值来把。
+    """
+    from app.database import milvus_client
+    from app.knowledge import retriever
+    from config.settings import settings
+
+    if not milvus_client.supports_hybrid():
+        print("  [混合检索] 当前集合无 BM25 稀疏字段，跳过（需 ingest_kb --reset 重建）")
+        return
+
+    assert settings.HYBRID_ENABLED, "配置里未启用混合检索"
+    assert retriever._hybrid_active(), "集合支持混合检索但未生效"
+
+    retriever.invalidate_cache()
+
+    # 1) 混合检索能返回结果，且分数标明是融合分（与余弦相似度不同量纲）
+    hits = retriever.retrieve("七天无理由退货的条件是什么？")
+    assert hits, "混合检索没有返回任何结果"
+    kinds = {h.get("score_kind") for h in hits}
+    assert kinds == {f"fusion-{settings.RERANK_STRATEGY}"}, f"score_kind 异常: {kinds}"
+    print(f"  [混合检索] 命中 {len(hits)} 条，分数类型 {kinds.pop()}（融合分，非余弦相似度）")
+
+    # 2) 词面精确的问题应当命中含该词的文档
+    #    这类问句是混合检索的主要受益场景：专有名词/条款名在原文里是精确出现的
+    exact = retriever.retrieve("黑金会员的积分有效期是多久？")
+    assert exact, "词面精确的问题没有命中"
+    joined = " ".join(h["text"] for h in exact)
+    assert "黑金" in joined or "积分" in joined, f"未命中预期内容: {[h['title'] for h in exact]}"
+    print(f"  [混合检索] 词面精确问题命中: {[h['title'] for h in exact][:2]}")
+
+    # 3) 缓存 key 必须区分检索模式，否则关掉混合检索还会返回旧的融合结果
+    key_hybrid = retriever._cache_key("测试问题", 4, 0.45)
+    retriever._hybrid_active.cache_clear()
+    original = settings.HYBRID_ENABLED
+    try:
+        settings.HYBRID_ENABLED = False
+        key_dense = retriever._cache_key("测试问题", 4, 0.45)
+    finally:
+        settings.HYBRID_ENABLED = original
+        retriever._hybrid_active.cache_clear()
+    assert key_hybrid != key_dense, "混合/纯向量的缓存 key 相同，会串用旧结果"
+    print("  [混合检索] 缓存 key 区分检索模式（不会串用旧结果）")
+
+    # 4) 最关键：不相关的问题在混合检索下**仍然是 0 命中**
+    for off_topic in ("今天北京天气怎么样？", "帮我写一段 Python 快速排序"):
+        got = retriever.retrieve(off_topic)
+        assert not got, (
+            f"混合检索让不相关问题也命中了 {len(got)} 条"
+            f"（{[(h['title'], h['score']) for h in got]}）——"
+            "说明稠密阈值这道语义门槛被绕过了，模型会被喂进无关上下文"
+        )
+    print("  [混合检索] 不相关问题仍然 0 命中（语义门槛未被 BM25 绕过）")
+
+    retriever.invalidate_cache()
 
 
 def check_degradation(user: dict) -> None:
@@ -813,29 +881,31 @@ def main() -> None:
     print("AgentFM 端到端冒烟测试")
     print("=" * 60)
 
-    print("[1/12] 检查 MySQL ...")
+    print("[1/13] 检查 MySQL ...")
     check_mysql()
-    print("[2/12] 检查认证 ...")
+    print("[2/13] 检查认证 ...")
     user = check_auth()
-    print("[3/12] 检查数据隔离 ...")
+    print("[3/13] 检查数据隔离 ...")
     check_isolation(user)
-    print("[4/12] 检查 Milvus 知识库 ...")
+    print("[4/13] 检查 Milvus 知识库 ...")
     check_milvus()
-    print("[5/12] 检查检索相关性 ...")
+    print("[5/13] 检查检索相关性 ...")
     check_retrieval()
-    print("[6/12] 检查认证限流 ...")
+    print("[6/13] 检查混合检索与重排 ...")
+    check_hybrid_retrieval()
+    print("[7/13] 检查认证限流 ...")
     check_rate_limit()
-    print("[7/12] 检查令牌吊销 ...")
+    print("[8/13] 检查令牌吊销 ...")
     check_token_revocation()
-    print("[8/12] 检查 Redis 加速层 ...")
+    print("[9/13] 检查 Redis 加速层 ...")
     check_redis()
-    print("[9/12] 检查角色与反馈 ...")
+    print("[10/13] 检查角色与反馈 ...")
     check_roles_and_feedback()
-    print("[10/12] 检查转人工 ...")
+    print("[11/13] 检查转人工 ...")
     check_handoff()
-    print("[11/12] 检查降级可辨识 ...")
+    print("[12/13] 检查降级可辨识 ...")
     check_degradation(user)
-    print("[12/12] 检查 LangGraph 工作流 ...")
+    print("[13/13] 检查 LangGraph 工作流 ...")
     check_graph(user)
 
     print("=" * 60)

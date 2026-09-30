@@ -285,6 +285,19 @@ AGENT_ROLE_LABEL = "坐席"
 WAIT_REFRESH_SECONDS = 3
 
 
+# 分数含义随检索模式而变：纯向量是余弦相似度（0~1，可比阈值），
+# 混合检索是 RRF/加权的融合分（不同量纲，没有绝对含义）。
+# 同一个词"相似度"套在两种分上会误导人，所以按 score_kind 分开标注。
+SCORE_LABELS = {"cosine": "相似度", }
+
+
+def _source_line(src: dict) -> str:
+    """渲染一条引用来源，按分数类型给不同的标签。"""
+    kind = src.get("score_kind", "cosine")
+    label = SCORE_LABELS.get(kind, "相关度")
+    return f"- **{src['title']}**（{src['source']}，{label} {src['score']}）"
+
+
 def _render_message(msg: dict) -> None:
     role = msg["role"]
     # 坐席回复：用自定义发言人名字，气泡上直接写「坐席」，
@@ -305,7 +318,7 @@ def _render_message(msg: dict) -> None:
         if msg.get("sources"):
             with st.expander("引用来源"):
                 for src in msg["sources"]:
-                    st.markdown(f"- **{src['title']}**（{src['source']}，相似度 {src['score']}）")
+                    st.markdown(_source_line(src))
         # 只对机器人的回答显示/：这个信号是给"回答质量"用的，
         # 给人工回复打分没有意义（人工的反馈应该走别的渠道）。
         if role == "assistant":
@@ -402,7 +415,7 @@ def render_chat() -> None:
         if result.get("sources"):
             with st.expander("引用来源"):
                 for src in result["sources"]:
-                    st.markdown(f"- **{src['title']}**（{src['source']}，相似度 {src['score']}）")
+                    st.markdown(_source_line(src))
 
     st.session_state.messages.append(
         {

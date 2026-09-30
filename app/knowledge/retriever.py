@@ -14,6 +14,7 @@ embedding 调用 + 一次向量检索，而知识库对**所有用户是同一�
 
 import hashlib
 import json
+from functools import lru_cache
 from typing import Dict,List,Optional
 
 from app.core import redis_client
@@ -25,17 +26,43 @@ from config.settings import settings
 logger=get_logger(__name__)
 
 # 缓存 key 里必须带上这些"会改变检索结果"的因素：换了 embedding 模型、
-# 切了集合、改了 top_k 或阈值，都应当视为不同的查询，否则会拿到不适用的旧结果。
+# 切了集合、改了 top_k/阈值/检索模式，都应当视为不同的查询，否则会拿到不适用的旧结果。
+# 检索模式尤其容易漏：同一句话在"纯向量"和"混合检索"下结果并不相同，
+# 不区分就会出现"把开关关掉后，返回的还是上次混合检索的缓存"这种诡异现象。
 def _cache_key(query: str, top_k: int, threshold: float) -> str:
+    mode = "hybrid" if _hybrid_active() else "dense"
+    if mode == "hybrid":
+        mode = f"{mode}:{settings.RERANK_STRATEGY}:{settings.RRF_K}"
     raw = "|".join([
         settings.MILVUS_COLLECTION,
         settings.EMBEDDING_API_MODEL,
         str(top_k),
         str(threshold),
+        mode,
         query.strip(),
     ])
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return redis_client.key("retrieve", digest)
+
+
+@lru_cache(maxsize=1)
+def _hybrid_active() -> bool:
+    """
+    本次进程是否真的走混合检索。
+
+    两个条件同时满足才走：配置打开，且**当前集合的 schema 支持**（含 BM25 稀疏字段）。
+    老集合没有稀疏字段，Milvus 又不支持给已有集合加 Function，所以只能重建；
+    这里不静默降级成"混合检索假装成功"，而是明确退回纯向量并提示重建方式。
+    """
+    if not settings.HYBRID_ENABLED:
+        return False
+    if milvus_client.supports_hybrid():
+        return True
+    logger.warning(
+        "集合缺少 BM25 稀疏字段，本次退回纯向量检索。"
+        "要启用混合检索请重建集合（语料可重新入库）：uv run python -m scripts.ingest_kb --reset"
+    )
+    return False
 
 
 def invalidate_cache() -> int:
@@ -59,8 +86,35 @@ def invalidate_cache() -> int:
         return 0
 
 
+def _search(query: str, query_vector: List[float], top_k: int) -> List[Dict]:
+    """
+    实际的检索逻辑（缓存之外的部分）。
+
+    混合检索时先做**语义门槛**再融合，顺序不能反：
+
+     1. 先用稠密向量 + 相似度阈值判断"这个问题到底在不在知识库的覆盖范围里"；
+        一条都不过阈值就直接返回空，保住"知识库中暂无相关信息"这个回答；
+     2. 门槛过了，再用稠密 + BM25 做混合检索并用 ranker 重排。
+
+    为什么门槛必须由稠密分支来把：**BM25 没有绝对分数基准**，它总能返回若干
+    "词面最像"的片段——哪怕问的是"今天北京天气怎么样"。如果让稀疏分支的结果
+    直接进最终结果，那个"不知道就说不知道"的闸门就废了，模型会被喂进无关上下文
+    然后编出答案。稠密分数有绝对含义（余弦相似度），适合当这个闸门。
+    """
+    if not _hybrid_active():
+        return milvus_client.search(query_vector, top_k=top_k)
+
+    # 1) 语义门槛：只要 1 条即可判断"有没有相关内容"，不用取满
+    if not milvus_client.search(query_vector, top_k=1):
+        logger.info("稠密分支无结果过阈值，判定为知识库未覆盖，跳过混合检索")
+        return []
+
+    # 2) 混合召回 + 重排
+    return milvus_client.hybrid_search(query_vector, query, top_k=top_k)
+
+
 def retrieve(query: str, top_k: int = None) -> List[Dict]:
-    """执行向量检索，返回命中的知识块（按相似度降序）。优先读缓存。"""
+    """执行检索，返回命中的知识块（已排序）。优先读缓存。"""
     effective_top_k = top_k or settings.RETRIEVE_TOP_K
     threshold = settings.RETRIEVE_SCORE_THRESHOLD
     cache_key = _cache_key(query, effective_top_k, threshold)
@@ -78,7 +132,7 @@ def retrieve(query: str, top_k: int = None) -> List[Dict]:
 
     embedder = get_embedder()
     query_vector = embedder.embed_query(query)
-    hits = milvus_client.search(query_vector, top_k=top_k)
+    hits = _search(query, query_vector, effective_top_k)
 
     if client is not None:
         try:
